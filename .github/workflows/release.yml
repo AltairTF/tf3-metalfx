@@ -58,8 +58,10 @@ jobs:
             IFS=. read -r major minor _ <<< "$latest"
             ver="$major.$((minor + 1)).0"
           fi
+          # Only the upstream repository publishes; forks (e.g. the macOS port) just build and test.
           publish=false
-          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+          if [ "$GITHUB_REPOSITORY" = lucasmokwa/tf3-dlss ] && [ "$GITHUB_EVENT_NAME" != pull_request ] \
+             && [ "$GITHUB_REF" = refs/heads/main ]; then
             publish=true
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"

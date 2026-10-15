@@ -2354,7 +2354,9 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
                             &g_dlss.mvImage, &g_dlss.mvView) ||
-            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            !CreateOwnImage(d, inW, inH, VK_FORMAT_R32_SFLOAT,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // recordings
                             &g_dlss.depth32Image, &g_dlss.depth32View)) {
             Log("[upscale] failed to create the motion-vector / depth images; upscaling stops");
             g_dlss.mvImage = VK_NULL_HANDLE;
