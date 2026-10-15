@@ -61,7 +61,7 @@ The rest of this page is for developers.
 | Camera motion | Compute pass: rebuilds each pixel's previous screen position from depth and the camera matrices |
 | Object motion | Finds moving models (vehicles) and redraws them into the motion-vector image with last frame's model matrix |
 | Upscale | After RCAS, records DLSS or FSR 3.1 into the game's command buffer, then swaps the blit's input for the upscaled image |
-| Extras | Texture LOD bias, sharpening (CAS-style for DLSS, RCAS for FSR), hover-highlight depth fix |
+| Extras | Texture LOD bias, sharpening (RCAS with a motion-adaptive boost for DLSS and MetalFX, FSR's own RCAS for FSR), hover-highlight depth fix |
 
 A release enables the layer with `version.dll` in the game folder (`layer/proxy/`): when the game
 loads it, it sets `VK_ADD_LAYER_PATH` to `TF3-DLSS\bin` and adds `VK_LAYER_TF3_dlss` to
@@ -110,7 +110,9 @@ Set `perf=1` in `tf3_dlss.cfg` (live) and every `perf_seconds` the log gets a `[
   passes, recording the upscaler, ...), with calls per frame and how often game threads waited for
   the layer's lock,
 - GPU time of each pass the layer adds (motion vectors, DLSS/FSR, sharpening, the rest), from
-  timestamp queries, and of the game's own FSR 1 passes that the upscaler makes redundant.
+  timestamp queries, and of the game's own FSR 1 passes that the upscaler makes redundant,
+- on macOS, MetalFX's own GPU time (its Metal command buffers run on a separate queue, so the
+  Vulkan timestamps only see the hand-off).
 
 With `overlay=1` the info box's last line shows the totals. To compare settings, keep the camera
 still in the same scene and change one cfg line at a time (most apply live), or toggle the

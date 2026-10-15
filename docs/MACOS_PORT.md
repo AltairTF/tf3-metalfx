@@ -54,6 +54,24 @@ Goal: replace the upscaler call with `MTLFXTemporalScaler`.
   screenshots, same spot), with no ghosting on still scenery and acceptable trails on vehicles, at
   the same or better frame rate.
 
+## Roadmap after step 3 (ideas from OptiScaler)
+OptiScaler (github.com/optiscaler/OptiScaler) swaps one upscaler for another in games that already call
+DLSS 2+ / FSR 2+ / XeSS, on Windows. TF3 only has FSR 1, and OptiScaler is GPL-3.0 while this layer is MIT,
+so it is used for ideas only: no code is copied. Where an idea needs an algorithm, it is written from an
+MIT source (AMD FidelityFX, Dear ImGui).
+
+1. MetalFX GPU time: the MetalFX command buffer's GPUStartTime..GPUEndTime in the info box, the log and
+   the perf=1 report. Also measure skip_game_fsr=1 (the game's 1:1 EASU + RCAS draws are wasted while
+   MetalFX runs). Done: ~3.4 ms at 50% in game; the game's FSR 1 passes cost ~0.1 ms, so skip stays off.
+2. RCAS sharpening (AMD FidelityFX FSR 1) plus motion-adaptive sharpening (OptiScaler's "MAS": more
+   sharpness where the motion vectors are long), replacing the CAS-style pass. Done (runs in game).
+3. Frame generation with MTLFXFrameInterpolator (macOS 26+, supported on the M4). TF3 draws its UI after
+   the blit, so the MetalFX output is a free UI-less image, which is what OptiScaler's HUDfix has to search
+   for. Phases: harness prototype, in game with the UI interpolated, then a separate UI texture.
+4. Reactive mask (MetalFX reactiveMaskTexture, macOS 14.4+) for smoke, particles, water and glass, only if
+   ghosting on smoke shows up in game.
+5. Optional: an in-game menu (Dear ImGui), FSR 3.1 built from source on MoltenVK as a second backend.
+
 ## Verification method (all steps)
 - Steam overlay screenshot (F12) captures the real swapchain. The game's own F9 screenshot renders a
   separate 5K frame without the upscaler path, so it is useless for A/B.
@@ -157,7 +175,8 @@ Goal: replace the upscaler call with `MTLFXTemporalScaler`.
 - VK_EXT_metal_objects is added at device creation when available. upscaler=metalfx (or auto on macOS).
 - MetalFX GPU cost on Apple M4 (standalone bench, tools in scratch): 1280x720->1440p ~8-10 ms,
   1707x960->1440p ~12-14 ms, 1920x1080->1440p ~14-15 ms. Cost follows the input pixel count, so render
-  scale 50-58% is the sweet spot.
+  scale 50-58% is the sweet spot. (Superseded: measured in game, 1280x720->1440p is ~3.4 ms; see the
+  in-game result under "Roadmap steps 1 and 2".)
 - Harness regression (MoltenVK of the game): test upscaler with/without MSAA, MetalFX with/without MSAA,
   overlay + hotkeys, auto backend selection: all 12/12 checks pass, no hangs.
 - In-game test config: macos/tf3_dlss.step3.cfg (metalfx, overlay, debug_keys) + launch.env with 3
@@ -170,3 +189,54 @@ Goal: replace the upscaler call with `MTLFXTemporalScaler`.
   MSAA fix confirmed in game: on a moving capture (mean MV 166 px) the GPU MVs match the CPU
   recomputation within 0.03 px (before the fix: 10-97 px). The other capture pairs had a still camera.
   Overlay title now says METALFX TEMPORAL (was hard-coded to DLSS). Capture env removed after the test.
+
+## Roadmap steps 1 and 2 (implemented 2026-10-15, verified in the harness and in game)
+- MetalFX GPU time: metalfx_bridge.mm adds a completion handler to each MetalFX command buffer and keeps
+  GPUEndTime - GPUStartTime (the median of the last 63 for the info box; median, mean and slowest per perf=1
+  window). Measured with a probe on the M4:
+  a command buffer that starts with encodeWaitForEvent gets its GPUStartTime only after the event is
+  signalled (0.25 ms after, with the signal 100 ms after commit), so the wait for the game's inputs is not
+  in the number. Shown as "GPU x.x MS" after the sizes in the info box, "[mfx] frame N: MetalFX GPU ..." every
+  log_every frames, and "[perf]   MetalFX GPU: ..." in the perf=1 report (the overlay's perf line says MFX).
+- Harness (1024x576 -> 2048x1152, M4): MetalFX 2.3-2.9 ms per frame. The 8-10 ms at 720p -> 1440p in the
+  tutorial came from a standalone bench and still has to be re-measured in game.
+- Sharpening (layer/shaders/sharpen.comp): sharpen_type=rcas (default) is RCAS from AMD FidelityFX FSR 1,
+  with its noise detection and with lobe x sharpness (1 = full RCAS, 0.5 = one stop less, 0 = off, so the
+  motion boost has no jump at 0). sharpen_type=cas keeps the old pass. Motion-adaptive sharpening adds
+  motion_sharpness x clamp((|mv| - motion_threshold) / (motion_limit - motion_threshold)), |mv| in output
+  pixels (defaults 0.4, 0, 10, OptiScaler's defaults). sharpen_debug=1 tints the boost red. The pass also
+  runs with sharpness=0 when motion_sharpness > 0. New macOS hotkeys: Ctrl+Shift+S (RCAS <-> CAS),
+  Ctrl+Shift+A (motion boost on/off).
+- RCAS is weaker than the old CAS at the same value (harness: Laplacian energy 4.69 at RCAS 0.3, 6.73 at
+  CAS 0.3, 7.44 at RCAS 1.0), partly because RCAS does nothing next to pure black or white (the
+  checkerboard). Default sharpness raised from 0.3 to 0.5.
+- Harness checks (game's MoltenVK, Khronos validation): test upscaler with sharpening + motion boost, with
+  skip_game_fsr=1 and with MSAA 2x: all checks pass, 0 validation errors. MetalFX with MSAA 2x and
+  skip_game_fsr=1: all checks pass; the same 41 validation messages as the previous commit (VkEvent on a
+  portability device, metal-objects export without the instance flag, objects left at device destroy).
+  Motion boost: during the pan (frame 149) 96% of the pixels are tinted (all but the UI panel); with a still
+  camera (frame 299) only the moving cube (1.7%). Frame time with the new pass equals the previous commit's
+  (5.52 vs 5.54 ms, same run; run-to-run noise is larger).
+- 2026-10-15 IN-GAME RESULT (50%, 1280x720 -> 2560x1440, MSAA off, perf=1, about 3.5 minutes after the
+  save loaded; build-macos/tf3_dlss.log): no errors, clean exit after 12043 frames, about 8700 of them
+  upscaled.
+  - MetalFX GPU over 8607 frames in 42 perf windows: 3.3-3.5 ms per frame in 28 windows (5865 frames,
+    weighted mean 3.45 ms). The other 14 windows had single command buffers of 19-85 ms, which pushed their
+    means to 4.0-5.7 ms and the info box's old exponential average to 6.6 ms. Those spikes came in the
+    busiest scenes (37-42 fps): the GPU interleaves the game's work with ours, so a command buffer's
+    start-to-end time sometimes covers some of the game's work. Since then the info box shows the median
+    of the last 63 command buffers, and the perf=1 report gives median, mean and slowest.
+  - The bench's 8-10 ms at 720p -> 1440p was about 2.5x too high. Frame time 17-33 ms (30-59 fps)
+    depending on the scene, so MetalFX is 10-20% of the frame.
+  - The layer's Vulkan passes, medians of the 42 windows (range in brackets): motion vectors 0.30 ms
+    (0.09-0.71), sharpening 0.69 ms (0.64-1.41; the compute pass plus the copy back into the output
+    image), the "upscaler" part 3.6 ms (3.4-6.9; the wait for MetalFX). The game's own FSR 1 passes cost
+    0.10 ms (0.08-0.78), so skip_game_fsr=1 saves about 0.1 ms: the default stays 0, and the cfg says so.
+  - Sharpening: the user switched RCAS <-> CAS (Ctrl+Shift+S) and the motion boost (Ctrl+Shift+A) a few
+    times; both hotkeys work on macOS. In the harness the old CAS pass cost about the same (0.49-0.74 ms vs
+    0.52-0.78 ms at 2048x1152), so most of the 0.69 ms is the pass itself and its copy, not the RCAS math.
+  - Not measured yet: 58% and 67% render scale.
+- Possible saving: the sharpening pass writes a temporary image and copies it back into the output
+  (2560x1440 RGBA8, about 30 MB of traffic per frame). With MetalFX, the scaler could write into the
+  temporary image and the sharpening pass into the output, which drops the copy. Worth doing with the
+  backend split before step 3, since frame generation also needs the output path reworked.

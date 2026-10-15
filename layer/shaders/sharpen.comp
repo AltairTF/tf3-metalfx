@@ -1,21 +1,81 @@
 #version 450
-// Optional sharpening after DLSS (sharpness setting in tf3_dlss.cfg; 0 = off).
-// Contrast-adaptive sharpening in the style of AMD FidelityFX CAS (cross pattern): each pixel is
-// pushed away from its four neighbours, less where local contrast is already high, so edges don't
-// ring and flat areas don't pick up noise. Reads the DLSS output, writes a temporary image that the
-// layer copies back.
+// Optional sharpening after the upscaler (sharpness in tf3_dlss.cfg; 0 = off). Reads the upscaler's
+// output, writes a temporary image that the layer copies back.
+//
+// type 0 (sharpen_type=rcas, default): RCAS, the robust contrast-adaptive sharpening of AMD FidelityFX
+//   FSR 1 (ffx_fsr1.h, MIT license, see licenses/THIRD-PARTY.txt). Each pixel is pushed away
+//   from its four neighbours by the largest amount that keeps it inside their range, so edges don't ring,
+//   and less where the neighbourhood looks like noise.
+// type 1 (sharpen_type=cas): the earlier pass in the style of AMD CAS (cross pattern), kept for comparing.
+//
+// Motion-adaptive sharpening (motion_sharpness): upscalers soften what moves, because they have less
+// history there to rebuild detail from, so the sharpness grows with the pixel's motion: 0 extra at
+// motion_threshold output pixels per frame, + motion_sharpness at motion_limit and above. The motion
+// vectors are the upscaler's input (render size, in render pixels).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 0) uniform sampler2D src;              // DLSS output
+layout(set = 0, binding = 0) uniform sampler2D src;              // upscaler output
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 2) uniform sampler2D motion;           // R16G16 float motion vectors
 
 layout(push_constant) uniform Params {
-    ivec2 size;
-    float sharpness;  // 0..1
+    ivec2 size;              // output
+    ivec2 motionSize;        // render size (the motion vectors)
+    float sharpness;         // 0..1
+    float motionSharpness;   // added at motionLimit (negative: less sharpening in motion)
+    float motionThreshold;   // output pixels per frame
+    float motionLimit;
+    int type;                // 0 = RCAS, 1 = CAS-style
+    int debug;               // 1 = tint: red where motion adds sharpening, blue where it removes some
 } pc;
 
+const float kRcasLimit = 0.25 - 1.0 / 16.0;
+
 vec3 at(ivec2 p) { return texelFetch(src, clamp(p, ivec2(0), pc.size - 1), 0).rgb; }
+
+// Extra sharpness for this pixel's motion.
+float MotionAdd(ivec2 p) {
+    if (pc.motionSharpness == 0.0) return 0.0;
+    vec2 toMotion = vec2(pc.motionSize) / vec2(pc.size);
+    ivec2 mp = clamp(ivec2((vec2(p) + 0.5) * toMotion), ivec2(0), pc.motionSize - 1);
+    vec2 mv = texelFetch(motion, mp, 0).xy / toMotion;  // render pixels -> output pixels
+    float len = length(mv);
+    if (!(len > pc.motionThreshold)) return 0.0;  // also catches NaN
+    float t = clamp((len - pc.motionThreshold) / max(pc.motionLimit - pc.motionThreshold, 1e-3), 0.0, 1.0);
+    return t * pc.motionSharpness;
+}
+
+// lobe (-kRcasLimit .. 0) for strength s (0..1): 1 = RCAS at full strength, 0.5 = one stop less, ...
+vec3 Rcas(vec3 b, vec3 d, vec3 e, vec3 f, vec3 h, float s) {
+    // luma times 2, for the noise detection
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
+    float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
+    float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+    float nz = clamp(abs(0.25 * (bL + dL + fL + hL) - eL) / max(range, 1e-5), 0.0, 1.0);
+    nz = 1.0 - 0.5 * nz;  // a lone bright or dark pixel (noise) gets half the sharpening
+    // the largest negative lobe that keeps the result inside [0, 1] and the ring's range, per channel
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1e-5));
+    vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-5));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-kRcasLimit, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * s * nz;
+    return (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+}
+
+vec3 Cas(vec3 b, vec3 d, vec3 e, vec3 f, vec3 h, float s) {
+    vec3 mn = min(min(min(d, e), min(f, b)), h);
+    vec3 mx = max(max(max(d, e), max(f, b)), h);
+    // Amount: high where there's headroom to the [0,1] range relative to the local maximum.
+    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));
+    float peak = -1.0 / mix(8.0, 5.0, s);
+    vec3 w = amp * peak;
+    return (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
+}
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -25,12 +85,12 @@ void main() {
     vec3 e = at(p);
     vec3 f = at(p + ivec2(1, 0));
     vec3 h = at(p + ivec2(0, 1));
-    vec3 mn = min(min(min(d, e), min(f, b)), h);
-    vec3 mx = max(max(max(d, e), max(f, b)), h);
-    // Amount: high where there's headroom to the [0,1] range relative to the local maximum.
-    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));
-    float peak = -1.0 / mix(8.0, 5.0, clamp(pc.sharpness, 0.0, 1.0));
-    vec3 w = amp * peak;
-    vec3 c = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
-    imageStore(dst, p, vec4(clamp(c, 0.0, 1.0), 1.0));
+    float add = MotionAdd(p);
+    float s = clamp(pc.sharpness + add, 0.0, 1.0);
+    vec3 c = e;
+    if (s > 0.0) c = pc.type == 1 ? Cas(b, d, e, f, h, s) : Rcas(b, d, e, f, h, s);
+    c = clamp(c, 0.0, 1.0);
+    if (pc.debug != 0 && add != 0.0)
+        c = mix(c, add > 0.0 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0), clamp(abs(add), 0.0, 1.0) * 0.6);
+    imageStore(dst, p, vec4(c, 1.0));
 }

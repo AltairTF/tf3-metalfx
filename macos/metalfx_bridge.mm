@@ -5,7 +5,10 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
 #include "metalfx_bridge.h"
+#include <algorithm>
 #include <cstdio>
+#include <mutex>
+#include <vector>
 
 namespace {
 constexpr int kSlots = 16;
@@ -14,10 +17,67 @@ id<MTLCommandQueue> g_queue = nil;
 id<MTLFXTemporalScaler> g_scaler = nil;
 id<MTLCommandBuffer> g_slotCb[kSlots] = {};
 
+// GPU timings, written by the command buffers' completion handlers (Metal's threads). Medians, not means:
+// when the game keeps the GPU busy, the GPU interleaves its work with ours, and now and then a command buffer's
+// start-to-end time covers some of the game's work too (seen in game: 3.4 ms typical, single frames up to 85 ms).
+std::mutex g_timeLock;
+constexpr int kRecent = 63;            // odd: one middle value
+double g_recent[kRecent] = {};         // last command buffers, for the overlay
+int g_recentN = 0, g_recentPos = 0;
+std::vector<double> g_winTimes;        // since the last mfx_gpu_window call
+constexpr size_t kWinCap = 16384;      // the median then uses the first ones (the sum and maximum stay exact)
+double g_winSumMs = 0.0, g_winMaxMs = 0.0;
+uint32_t g_winCount = 0;
+
 void SetErr(char* err, int len, const char* msg) {
     if (err && len > 0) std::snprintf(err, (size_t)len, "%s", msg);
 }
+
+double Median(double* v, size_t n) {
+    if (!n) return 0.0;
+    std::nth_element(v, v + n / 2, v + n);
+    double m = v[n / 2];
+    if (n % 2 == 0) m = (m + *std::max_element(v, v + n / 2)) * 0.5;
+    return m;
+}
+
+void AddGpuTime(double ms) {
+    std::lock_guard<std::mutex> lk(g_timeLock);
+    g_recent[g_recentPos] = ms;
+    g_recentPos = (g_recentPos + 1) % kRecent;
+    if (g_recentN < kRecent) ++g_recentN;
+    if (g_winTimes.size() < kWinCap) g_winTimes.push_back(ms);
+    g_winSumMs += ms;
+    if (ms > g_winMaxMs) g_winMaxMs = ms;
+    ++g_winCount;
+}
 }  // namespace
+
+float mfx_gpu_ms(void) {
+    double v[kRecent];
+    int n;
+    {
+        std::lock_guard<std::mutex> lk(g_timeLock);
+        n = g_recentN;
+        std::copy(g_recent, g_recent + n, v);
+    }
+    return (float)Median(v, (size_t)n);
+}
+
+void mfx_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count) {
+    std::vector<double> times;
+    {
+        std::lock_guard<std::mutex> lk(g_timeLock);
+        times.swap(g_winTimes);
+        if (sumMs) *sumMs = g_winSumMs;
+        if (maxMs) *maxMs = g_winMaxMs;
+        if (count) *count = g_winCount;
+        g_winSumMs = g_winMaxMs = 0.0;
+        g_winCount = 0;
+        g_winTimes.reserve(1024);
+    }
+    if (medianMs) *medianMs = Median(times.data(), times.size());
+}
 
 bool mfx_init(void* mtlDevice, char* err, int errLen) {
     g_device = (__bridge id<MTLDevice>)mtlDevice;
@@ -80,6 +140,10 @@ bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uin
     desc.outputHeight = outH;
     desc.autoExposureEnabled = NO;  // the input is already tone-mapped
     g_scaler = [desc newTemporalScalerWithDevice:g_device];
+    {
+        std::lock_guard<std::mutex> lk(g_timeLock);
+        g_recentN = g_recentPos = 0;  // new sizes: start the overlay's median again
+    }
     if (!g_scaler) {
         SetErr(err, errLen, "newTemporalScalerWithDevice returned nil (unsupported sizes or formats)");
         return false;
@@ -160,6 +224,11 @@ bool mfx_encode(int slot, const MfxFrame* f, char* err, int errLen) {
     }
     // Always signal, or the game's GPU work would wait forever.
     [cb encodeSignalEvent:evOut value:f->signalValue];
+    if (ok)
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
+            if (done.status == MTLCommandBufferStatusCompleted && ms > 0.0 && ms < 1000.0) AddGpuTime(ms);
+        }];
     [cb commit];
     g_slotCb[slot] = cb;
     return ok;

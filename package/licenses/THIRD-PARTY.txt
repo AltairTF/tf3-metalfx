@@ -33,8 +33,11 @@ License:  MIT, Copyright (c) 2024 Advanced Micro Devices, Inc.
 Note:     AMD, FidelityFX and FSR are trademarks of Advanced Micro Devices,
           Inc. TF3-DLSS is not made or endorsed by AMD.
 
-The optional sharpening pass used with DLSS is contrast-adaptive sharpening
-written for this mod, modelled on the approach of AMD FidelityFX CAS.
+The optional sharpening pass after DLSS / MetalFX follows RCAS (robust
+contrast-adaptive sharpening) from AMD FidelityFX Super Resolution 1
+(ffx_fsr1.h, MIT, Copyright (c) 2021 Advanced Micro Devices, Inc.; same terms
+as AMD-FidelityFX-SDK-LICENSE.txt). The earlier sharpening (sharpen_type=cas)
+was written for this mod, modelled on the approach of AMD FidelityFX CAS.
 
 
 Vulkan headers

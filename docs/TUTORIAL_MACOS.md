@@ -60,14 +60,18 @@ Depois siga os passos 3 e 4 da seção anterior.
   | Atalho | Efeito |
   |---|---|
   | **Ctrl+Shift+D** | MetalFX liga/desliga (desligado = upscaler do próprio jogo, bom para comparar) |
-  | **Ctrl+Shift+O** | Caixa de informação: upscaler, resoluções, nitidez, FPS |
+  | **Ctrl+Shift+O** | Caixa de informação: upscaler, resoluções, tempo do MetalFX na GPU, nitidez, FPS |
   | **Ctrl+Shift+↑ / ↓** | Nitidez +/- 0,1 |
+  | **Ctrl+Shift+S** | Tipo de nitidez: RCAS (padrão) ou CAS (a da versão 0.1), para comparar |
+  | **Ctrl+Shift+A** | Nitidez extra no que se move: liga/desliga |
 
 - As configurações ficam em `~/.local/share/tf3-metalfx/tf3_dlss.cfg`. Cada linha está explicada no
   próprio arquivo, e as mudanças valem assim que o arquivo é salvo, mesmo com o jogo aberto.
   As mais úteis:
   - `enabled=0/1`: liga ou desliga o upscaler.
-  - `sharpness=0.3`: nitidez depois do MetalFX (0 a 1).
+  - `sharpness=0.5`: nitidez depois do MetalFX (0 a 1), com o RCAS da AMD: não cria halos nas bordas.
+  - `motion_sharpness=0.4`: nitidez extra para o que se move (o MetalFX suaviza o movimento);
+    0 desliga.
   - `overlay=1`: mostra a caixa de informação ao iniciar.
   - `mip_bias=auto`: deixa as texturas nítidas apesar da resolução menor (vale após reiniciar o jogo).
 
@@ -75,13 +79,14 @@ Depois siga os passos 3 e 4 da seção anterior.
 
 | Escala do jogo | Resolução interna | Custo do MetalFX na GPU | FPS observado com MetalFX |
 |---|---|---|---|
-| 50% | 1280x720 | ~8-10 ms | ~38-45 |
-| 60% | 1536x864 | ~11-13 ms | — |
-| 65-67% | ~1700x950 | ~12-14 ms | ~25 |
-| 75% | 1920x1080 | ~15 ms | — |
+| 50% | 1280x720 | ~3,4 ms | ~30-57 (depende da cena) |
+| 65-67% | ~1700x950 | ainda não medido no jogo | ~25 |
 
-O custo do MetalFX cresce com a resolução interna. Por isso **50-58%** dá o melhor equilíbrio: a imagem
-com MetalFX a 50% já fica mais limpa que a de 65-75% sem ele.
+O custo de 50% foi medido no jogo, em ~8.600 frames (3,3-3,5 ms na maior parte do tempo). Os outros passos do mod
+somam ~1 ms: nitidez ~0,7 ms, vetores de movimento ~0,3 ms. O número da sua máquina aparece na
+caixa de informação (Ctrl+Shift+O, "GPU x MS" ao lado das resoluções). O custo do MetalFX cresce com a
+resolução interna. Por isso **50-58%** dá o melhor equilíbrio: a imagem com MetalFX a 50% já fica mais
+limpa que a de 65-75% sem ele.
 
 ## 4. Como funciona
 
@@ -248,7 +253,8 @@ Elas podem ir num arquivo `launch.env` ao lado do `launch.sh` (uma `VAR=valor` p
 - Só macOS com Apple Silicon e MoltenVK (o driver Vulkan padrão do jogo no Mac).
 - Fumaça, nuvens e outros efeitos sem depth não têm vetores de movimento e podem deixar rastro.
 - Pessoas e animais (modelos com esqueleto) recebem só o movimento da câmera.
-- O MetalFX tem custo de GPU relevante no M4 base. Chips Pro/Max devem ter folga bem maior.
+- O MetalFX custa ~3,4 ms de GPU por frame no M4 base a 50% (cerca de 15% do frame a 40 fps).
+  Chips Pro/Max devem ter folga bem maior.
 - Experimental: use por sua conta. Para voltar ao normal, basta apagar a opção de inicialização.
 
 ## 9. Créditos

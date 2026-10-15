@@ -314,6 +314,11 @@ struct Config {
     bool mipBiasAuto = true;    // texture LOD bias: log2(render/display), -1 at 50% (needs a restart)
     float mipBias = 0.f;        // used when mipBiasAuto is false (0 = off)
     float sharpness = 0.f;      // sharpening after DLSS, 0..1 (0 = off)
+    int sharpenType = 0;        // 0 = RCAS (AMD FidelityFX FSR 1), 1 = the earlier CAS-style pass
+    float motionSharpness = 0.4f;   // extra sharpness for moving pixels, reached at motionLimit (0 = off)
+    float motionThreshold = 0.f;    // output pixels per frame below which nothing is added
+    float motionLimit = 10.f;       // output pixels per frame where the full motionSharpness applies
+    int sharpenDebug = 0;       // 1 = tint where motion changes the sharpening (red = more)
     float fsrSharpness = 0.5f;  // FSR's own sharpening (RCAS), 0..1 (0 = off)
     int overlay = 0;            // 1 = on-screen info box (upscaler, sizes, sharpness, jitter)
     float overlayX = 25.f;      // its top-left corner, percent of the screen from the left ...
@@ -404,6 +409,17 @@ bool LoadConfig() {
         else if (k == "object_depth_test") c.objectDepthTest = iv;
         else if (k == "fix_highlight_depth") c.fixHighlightDepth = iv;
         else if (k == "sharpness") c.sharpness = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "sharpen_type") {
+            std::string lv = v;
+            for (auto& ch : lv) ch = (char)std::tolower((unsigned char)ch);
+            if (lv == "rcas") c.sharpenType = 0;
+            else if (lv == "cas") c.sharpenType = 1;
+            else Log("[cfg] sharpen_type=%s not understood (rcas or cas); using rcas", v.c_str());
+        }
+        else if (k == "motion_sharpness") c.motionSharpness = std::min(std::max(fv, -1.f), 1.f);
+        else if (k == "motion_threshold") c.motionThreshold = std::max(fv, 0.f);
+        else if (k == "motion_limit") c.motionLimit = std::max(fv, 0.f);
+        else if (k == "sharpen_debug") c.sharpenDebug = iv;
         else if (k == "fsr_sharpness") c.fsrSharpness = std::min(std::max(fv, 0.f), 1.f);
         else if (k == "mip_bias") {
             c.mipBiasAuto = v == "auto";
@@ -426,12 +442,16 @@ bool LoadConfig() {
     Log("[cfg] loaded %s: enabled=%d upscaler=%s preset=%d motion_vectors=%d object_motion=%d jitter=%d (phases %d, "
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
-        "perf_seconds=%g skip_game_fsr=%d",
+        "perf_seconds=%g skip_game_fsr=%d sharpen_type=%s motion_sharpness=%g motion_threshold=%g motion_limit=%g "
+        "sharpen_debug=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
-        c.perf, c.perfSeconds, c.skipGameFsr);
+        c.perf, c.perfSeconds, c.skipGameFsr, c.sharpenType == 1 ? "cas" : "rcas", c.motionSharpness,
+        c.motionThreshold, c.motionLimit, c.sharpenDebug);
+    if (c.motionLimit <= c.motionThreshold)
+        Log("[cfg] motion_limit (%g) should be above motion_threshold (%g)", c.motionLimit, c.motionThreshold);
     return true;
 }
 
@@ -1217,6 +1237,7 @@ struct Dlss {
     VkImage shpImage = VK_NULL_HANDLE;   // temporary result, copied back into outImage
     VkImageView shpView = VK_NULL_HANDLE;
     VkImageView shpBoundOut = VK_NULL_HANDLE;
+    VkImageView shpBoundMv = VK_NULL_HANDLE;  // motion vectors for motion-adaptive sharpening
     // test upscaler (TestUpscaler)
     bool tstFailed = false;
     VkDescriptorSetLayout tstSetLayout = VK_NULL_HANDLE;
@@ -2432,18 +2453,25 @@ const uint32_t kShpSpirv[] = {
 };
 struct ShpPush {
     int32_t size[2];
+    int32_t motionSize[2];
     float sharpness;
+    float motionSharpness;
+    float motionThreshold;
+    float motionLimit;
+    int32_t type;
+    int32_t debug;
 };
 
 bool EnsureSharpen(DeviceData* d) {
     if (g_dlss.shpFailed) return false;
     if (!g_dlss.shpPipeline) {
         g_dlss.shpFailed = true;  // cleared on success
-        VkDescriptorSetLayoutBinding b[2] = {};
+        VkDescriptorSetLayoutBinding b[3] = {};
         b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        li.bindingCount = 2;
+        li.bindingCount = 3;
         li.pBindings = b;
         if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_dlss.shpSetLayout) != VK_SUCCESS) return false;
         VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ShpPush)};
@@ -2467,7 +2495,7 @@ bool EnsureSharpen(DeviceData* d) {
         VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.shpPipeline);
         d->DestroyShaderModule(d->device, mod, nullptr);
         if (r != VK_SUCCESS) return false;
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.maxSets = 1;
@@ -2501,12 +2529,23 @@ bool EnsureSharpen(DeviceData* d) {
         d->UpdateDescriptorSets(d->device, 2, w, 0, nullptr);
         g_dlss.shpBoundOut = g_dlss.outView;
     }
+    if (g_dlss.shpBoundMv != g_dlss.mvView) {  // render size changed: new motion-vector image
+        if (g_dlss.shpSetUsed) d->DeviceWaitIdle(d->device);
+        VkDescriptorImageInfo mv{g_dlss.pointSampler, g_dlss.mvView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_dlss.shpSet, 2, 0, 1,
+                               VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &mv, nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+        g_dlss.shpBoundMv = g_dlss.mvView;
+    }
     return true;
 }
 
-// After Evaluate, with outImage in GENERAL: sharpen into shpImage, copy back into outImage.
+// After Evaluate, with outImage in GENERAL and mvImage in SHADER_READ_ONLY: sharpen into shpImage, copy back
+// into outImage.
 void RecordSharpen(DeviceData* d, VkCommandBuffer cb) {
-    if (g_cfg.sharpness <= 0.f || !g_dlss.pointSampler || !EnsureSharpen(d)) return;
+    if ((g_cfg.sharpness <= 0.f && g_cfg.motionSharpness <= 0.f) || !g_dlss.pointSampler || !g_dlss.mvView ||
+        !EnsureSharpen(d))
+        return;
     VkImageMemoryBarrier b[2] = {};
     for (auto& x : b) {
         x.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -2525,7 +2564,14 @@ void RecordSharpen(DeviceData* d, VkCommandBuffer cb) {
     b[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                           0, nullptr, 2, b);
-    ShpPush pc{{(int32_t)g_dlss.outW, (int32_t)g_dlss.outH}, g_cfg.sharpness};
+    ShpPush pc{{(int32_t)g_dlss.outW, (int32_t)g_dlss.outH},
+               {(int32_t)g_dlss.inW, (int32_t)g_dlss.inH},
+               g_cfg.sharpness,
+               g_cfg.motionSharpness,
+               g_cfg.motionThreshold,
+               g_cfg.motionLimit,
+               g_cfg.sharpenType,
+               g_cfg.sharpenDebug};
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.shpPipeline);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.shpPipeLayout, 0, 1, &g_dlss.shpSet, 0, nullptr);
     d->CmdPushConstants(cb, g_dlss.shpPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
@@ -3332,6 +3378,9 @@ void PerfReset() {
     for (double& m : g_gpu.partMs) m = 0.0;
     g_gpu.totalMs = g_gpu.gameFsrMs = 0.0;
     g_gpu.frames = g_gpu.gameFsrFrames = 0;
+#ifdef __APPLE__
+    mfx_gpu_window(nullptr, nullptr, nullptr, nullptr);  // MetalFX's own GPU times: start a new window too
+#endif
 }
 
 // Once per presented frame. Caller holds g_t.
@@ -3411,10 +3460,25 @@ void PerfPresent() {
             gpuMs, gp.c_str(), game);
     } else
         Log("[perf]   GPU: %s", g_gpu.failed ? "no timings on this GPU" : "nothing measured (no upscaler ran)");
+    const char* upName = g_dlss.backend == Backend::Fsr ? "FSR" : g_dlss.backend == Backend::MetalFx ? "MFX" : "DLSS";
+#ifdef __APPLE__
+    // MetalFX runs on its own Metal queue: the layer's Vulkan "upscaler" part above is the colour copy plus
+    // the wait for MetalFX, so its own command buffer times are the cost of MetalFX itself.
+    // The median is the typical cost: now and then a command buffer's time also covers some of the game's work.
+    double mfxMed = 0.0, mfxSum = 0.0, mfxMax = 0.0;
+    uint32_t mfxN = 0;
+    mfx_gpu_window(&mfxMed, &mfxSum, &mfxMax, &mfxN);
+    if (mfxN) {
+        upMs = mfxMed;
+        Log("[perf]   MetalFX GPU: %.3f ms per frame (median, %.1f%% of the frame); mean %.3f, slowest %.3f ms, "
+            "%u frames | %ux%u -> %ux%u",
+            mfxMed, 100.0 * mfxMed / avg, mfxSum / mfxN, mfxMax, mfxN, g_dlss.inW, g_dlss.inH, g_dlss.outW,
+            g_dlss.outH);
+    }
+#endif
     char ov[96];
     if (g_gpu.frames)
-        std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU %.2f MS  %s %.2f", cpuMs, gpuMs,
-                      g_dlss.backend == Backend::Fsr ? "FSR" : "DLSS", upMs);
+        std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU %.2f MS  %s %.2f", cpuMs, gpuMs, upName, upMs);
     else std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU -", cpuMs);
     g_pw.overlayLine = ov;
 
@@ -3576,8 +3640,18 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
     else std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET AUTO");
     std::snprintf(b[1], sizeof b[1], "%ux%u -> %ux%u (%d%%)", inW, inH, g_dlss.outW, g_dlss.outH,
                   g_dlss.outW ? (int)std::lround(100.0 * inW / g_dlss.outW) : 0);
-    std::snprintf(b[2], sizeof b[2], "SHARPNESS %.1f         [CTRL+SHIFT+UP/DOWN]",
-                  fsr ? g_cfg.fsrSharpness : g_cfg.sharpness);
+#ifdef __APPLE__
+    if (backend == Backend::MetalFx && mfx_gpu_ms() > 0.f) {  // MetalFX's own GPU time, median of the last frames
+        size_t n = std::strlen(b[1]);
+        std::snprintf(b[1] + n, sizeof b[1] - n, "  GPU %.1f MS", mfx_gpu_ms());
+    }
+#endif
+    if (fsr) std::snprintf(b[2], sizeof b[2], "SHARPNESS %.1f (FSR RCAS)  [CTRL+SHIFT+UP/DOWN]", g_cfg.fsrSharpness);
+    else if (g_cfg.motionSharpness != 0.f)
+        std::snprintf(b[2], sizeof b[2], "SHARP %.1f %s, MOTION %+.1f  [UP/DN S A]", g_cfg.sharpness,
+                      g_cfg.sharpenType == 1 ? "CAS" : "RCAS", g_cfg.motionSharpness);
+    else std::snprintf(b[2], sizeof b[2], "SHARP %.1f %s, NO MOTION  [UP/DN S A]", g_cfg.sharpness,
+                       g_cfg.sharpenType == 1 ? "CAS" : "RCAS");
     float sx = fsr ? g_cfg.fsrJitterSignX : g_cfg.jitterSignX, sy = fsr ? g_cfg.fsrJitterSignY : g_cfg.jitterSignY;
     if (cs.jitterSet)
         std::snprintf(b[3], sizeof b[3], "JITTER %u/%u, SIGN X%+.0f Y%+.0f   [K, J]", cs.jitterIdx + 1,
@@ -6454,12 +6528,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
 #endif
 #ifdef __APPLE__
         // macOS hotkeys (debug_keys=1, game in front): Ctrl+Shift+D upscaler on/off (compare with the game's
-        // FSR 1), Ctrl+Shift+O info box, Ctrl+Shift+Up/Down sharpness +/- 0.1.
+        // FSR 1), Ctrl+Shift+O info box, Ctrl+Shift+Up/Down sharpness +/- 0.1, Ctrl+Shift+S sharpening RCAS <->
+        // CAS, Ctrl+Shift+A motion-adaptive sharpening on/off. Like the cfg_live reload, they last until
+        // tf3_dlss.cfg is saved again.
         if (g_cfg.debugKeys && g_frame % 2 == 0) {
-            enum { kD = 2, kO = 31, kUp = 126, kDown = 125, kShiftL = 56, kShiftR = 60, kCtrlL = 59, kCtrlR = 62 };
+            enum { kA = 0, kS = 1, kD = 2, kO = 31, kUp = 126, kDown = 125, kShiftL = 56, kShiftR = 60, kCtrlL = 59,
+                   kCtrlR = 62 };
             bool ctrlShift = (mfx_key_down(kCtrlL) || mfx_key_down(kCtrlR)) &&
                              (mfx_key_down(kShiftL) || mfx_key_down(kShiftR)) && mfx_app_focused();
-            static bool dWas = false, oWas = false, upWas = false, downWas = false;
+            static bool dWas = false, oWas = false, upWas = false, downWas = false, sWas = false, aWas = false;
+            static float motionWas = 0.4f;  // the motion_sharpness Ctrl+Shift+A turns back on
             auto edge = [&](int key, bool& was) {
                 bool down = ctrlShift && mfx_key_down(key);
                 bool e = down && !was;
@@ -6480,6 +6558,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             if (up || dn) {
                 g_cfg.sharpness = std::min(1.f, std::max(0.f, g_cfg.sharpness + (up ? 0.1f : -0.1f)));
                 Log("[sharpen] Ctrl+Shift+%s: sharpness %.1f", up ? "Up" : "Down", g_cfg.sharpness);
+            }
+            if (edge(kS, sWas)) {
+                g_cfg.sharpenType = g_cfg.sharpenType == 1 ? 0 : 1;
+                Log("[sharpen] Ctrl+Shift+S: %s (frame %llu)", g_cfg.sharpenType == 1 ? "CAS-style" : "RCAS",
+                    (unsigned long long)g_frame);
+            }
+            if (edge(kA, aWas)) {
+                if (g_cfg.motionSharpness != 0.f) {
+                    motionWas = g_cfg.motionSharpness;
+                    g_cfg.motionSharpness = 0.f;
+                } else g_cfg.motionSharpness = motionWas;
+                Log("[sharpen] Ctrl+Shift+A: motion-adaptive sharpening %+.1f (frame %llu)", g_cfg.motionSharpness,
+                    (unsigned long long)g_frame);
             }
         }
 #endif
@@ -6524,6 +6615,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         if (LogFrame(g_frame)) {
             Log("[frame] %llu: dlss %s, blit swapped %s", (unsigned long long)g_frame,
                 g_lastDlssFrame == g_frame ? "ran" : "did not run", g_lastSwapFrame == g_frame ? "yes" : "no");
+#ifdef __APPLE__
+            if (g_dlss.backend == Backend::MetalFx && mfx_gpu_ms() > 0.f)
+                Log("[mfx] frame %llu: MetalFX GPU %.2f ms (median of the last frames), %ux%u -> %ux%u, %.1f fps",
+                    (unsigned long long)g_frame, mfx_gpu_ms(), g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH, g_fps);
+#endif
         }
         ++g_frame;
         UpdateHot();

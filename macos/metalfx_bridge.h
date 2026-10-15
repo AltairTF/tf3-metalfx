@@ -53,6 +53,15 @@ struct MfxFrame {
 // signals "out" so the game never waits forever. False on error (err filled).
 bool mfx_encode(int slot, const MfxFrame* f, char* err, int errLen);
 
+// GPU time of the MetalFX command buffers, GPUStartTime to GPUEndTime. The GPU starts a command buffer only
+// once the game's inputs are signalled, so the wait for them is not included (measured on the M4).
+// When the game keeps the GPU busy, a command buffer's time now and then also covers some of the game's work, so
+// the typical cost is the median.
+// mfx_gpu_ms: median of the last 63 command buffers, in ms (0 until one finished).
+float mfx_gpu_ms(void);
+// Since the last call, for the perf=1 report: median, total and slowest ms, and how many command buffers.
+void mfx_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count);
+
 // Debug hotkeys on macOS (debug_keys=1): is this macOS virtual key held, and is our process the frontmost app.
 bool mfx_key_down(int macKeyCode);
 bool mfx_app_focused(void);
