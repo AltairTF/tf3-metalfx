@@ -114,6 +114,11 @@ void mfx_sys_start(void);
 void mfx_sys_window(double* gpuBusyPct, double* processCpuPct, double* topThreadPct, char* topThreads,
                     int topThreadsLen);
 
+// Refresh clock of the main display (CVDisplayLink, started on first call): the time of the last refresh and the
+// refresh period, both in ns of mach_absolute_time (clock_gettime_nsec_np(CLOCK_UPTIME_RAW)). False until the
+// first refresh was seen (or if there is no display link).
+bool mfx_vsync(uint64_t* lastVsyncNs, uint64_t* periodNs);
+
 // Debug hotkeys on macOS (debug_keys=1): is this macOS virtual key held, and is our process the frontmost app.
 bool mfx_key_down(int macKeyCode);
 bool mfx_app_focused(void);

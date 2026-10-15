@@ -48,7 +48,7 @@ add_library(VkLayer_tf3_dlss SHARED "${LAYER_DIR}/src/layer.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/metalfx_bridge.mm" ${SHADER_INCS})
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/metalfx_bridge.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(VkLayer_tf3_dlss PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation"
-                      "-framework AppKit" "-framework CoreGraphics" "-framework IOKit")
+                      "-framework AppKit" "-framework CoreGraphics" "-framework IOKit" "-framework CoreVideo")
 target_include_directories(VkLayer_tf3_dlss PRIVATE "${VULKAN_INCLUDE}" "${DLSS_SDK}/include" "${GEN_DIR}"
                            "${CMAKE_CURRENT_SOURCE_DIR}"
                            "${LAYER_DIR}/../third_party/ffx-api/include")

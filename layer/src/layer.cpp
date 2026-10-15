@@ -345,6 +345,7 @@ struct Config {
     float reactiveWater = 0.3f;     // water surfaces (waves and reflections move without motion vectors)
     float reactiveTransparent = 0.f;  // other blended 3D draws (glass, ...)
     int reactiveDebug = 0;          // 1 = tint the image red where the mask is set
+    int fpsLimit = 0;               // macOS: lock the frame rate (30 = every frame 2 refreshes at 60 Hz); 0 = off
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -455,6 +456,7 @@ bool LoadConfig() {
         else if (k == "reactive_water") c.reactiveWater = std::min(std::max(fv, 0.f), 1.f);
         else if (k == "reactive_transparent") c.reactiveTransparent = std::min(std::max(fv, 0.f), 1.f);
         else if (k == "reactive_debug") c.reactiveDebug = iv;
+        else if (k == "fps_limit") c.fpsLimit = std::max(iv, 0);
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
@@ -463,14 +465,14 @@ bool LoadConfig() {
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
         "perf_seconds=%g skip_game_fsr=%d sharpen_type=%s motion_sharpness=%g motion_threshold=%g motion_limit=%g "
         "sharpen_debug=%d frame_gen=%d upscale_to=%d reactive=%d (particles %g, animated %g, water %g, "
-        "transparent %g, debug %d)",
+        "transparent %g, debug %d) fps_limit=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
         c.perf, c.perfSeconds, c.skipGameFsr, c.sharpenType == 1 ? "cas" : "rcas", c.motionSharpness,
         c.motionThreshold, c.motionLimit, c.sharpenDebug, c.frameGen, c.upscaleTo, c.reactive, c.reactiveParticles,
-        c.reactiveAnimated, c.reactiveWater, c.reactiveTransparent, c.reactiveDebug);
+        c.reactiveAnimated, c.reactiveWater, c.reactiveTransparent, c.reactiveDebug, c.fpsLimit);
     if (c.motionLimit <= c.motionThreshold)
         Log("[cfg] motion_limit (%g) should be above motion_threshold (%g)", c.motionLimit, c.motionThreshold);
     return true;
@@ -4736,6 +4738,84 @@ void MfxCommit(MfxJob& job, bool submitted) {
 // With FIFO presentation the two images are shown at successive refreshes, so the game runs at most at half
 // the refresh rate: 30 fps -> 60 on a 60 Hz display.
 constexpr int kFgSlots = 8;  // must match metalfx_bridge.mm
+// ---------------------------------------------------------------------------------------------
+// Frame rate lock (fps_limit=30): every frame on screen for the same number of refreshes
+// ---------------------------------------------------------------------------------------------
+// TF3 presents without vsync (IMMEDIATE) at a frame rate that changes from frame to frame (37-47 fps on an
+// M4). On a 60 Hz screen without VRR each frame then stays up for 1 or 2 refreshes in an uneven pattern, which
+// looks like jumps, and the image can tear. With fps_limit the swapchain uses FIFO (vsync) and the layer hands
+// each frame to the driver half a refresh before every n-th refresh (n = refresh rate / fps_limit, 2 for 30 on
+// 60 Hz), so FIFO shows it at that refresh. The refresh times come from a CVDisplayLink on the main display
+// (mfx_vsync). Holding the present also holds the game's thread, so it doesn't run ahead and add latency.
+// Measured outside the game: MoltenVK's VK_GOOGLE_display_timing doesn't help here. presentAtTime wasn't
+// honoured (frames came ~24 ms before the asked time), and the "actual" present times it reports are the
+// hand-over times (~1 ms after the present), not refreshes.
+struct FpsLock {
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;  // the swapchain set up with FIFO for the lock
+    uint64_t lastTarget = 0;  // the refresh the last frame was handed over for
+    uint64_t presents = 0, lateFrames = 0, sleptNs = 0, noClock = 0;
+    uint64_t gaps[4] = {};  // refreshes between consecutive targets: 1, 2, 3, 4+
+} g_fpsLock;
+
+uint64_t NowNs() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+// At swapchain creation (caller holds g_t).
+void FpsLockSwapchain(VkSwapchainKHR swapchain, bool fifo) {
+    g_fpsLock.swapchain = fifo ? swapchain : VK_NULL_HANDLE;
+    g_fpsLock.lastTarget = 0;
+    if (!fifo) return;
+    uint64_t v = 0, r = 0;
+    bool clock = mfx_vsync(&v, &r);  // starts the display link
+    Log("[fps] frame rate lock to %d fps: FIFO; refresh clock %s", g_cfg.fpsLimit,
+        clock ? (std::to_string(r / 1000) + " us per refresh").c_str() : "starting");
+}
+
+// Instead of the next layer's vkQueuePresentKHR when frame generation is off.
+VkResult PacedPresent(DeviceData* d, VkQueue queue, const VkPresentInfoKHR* pInfo) {
+    uint64_t sleepUntil = 0;
+    {
+        TLock lk(g_t);
+        FpsLock& L = g_fpsLock;
+        if (g_cfg.fpsLimit > 0 && L.swapchain && pInfo->swapchainCount == 1 && pInfo->pSwapchains[0] == L.swapchain) {
+            uint64_t vsync = 0, R = 0, now = NowNs();
+            if (!mfx_vsync(&vsync, &R)) {
+                ++L.noClock;  // no refresh clock (yet): FIFO alone
+            } else {
+                uint64_t n = std::max<uint64_t>(1, (uint64_t)std::llround(1e9 / ((double)R * g_cfg.fpsLimit)));
+                // the refresh n after the last frame's, on the display's grid; a late frame takes the first
+                // refresh it can still make, and the count goes on from there
+                uint64_t want = L.lastTarget ? L.lastTarget + n * R : now + R;
+                want = want > vsync ? vsync + (want - vsync + R / 2) / R * R : vsync + R;
+                if (want < now + R / 2) {
+                    want = vsync + ((now + R / 2 - vsync) + R - 1) / R * R;
+                    ++L.lateFrames;
+                } else
+                    sleepUntil = want - R / 2;
+                if (L.lastTarget && want > L.lastTarget) ++L.gaps[std::min<uint64_t>((want - L.lastTarget + R / 2) / R, 4) - 1];
+                L.lastTarget = want;
+                ++L.presents;
+                if (L.presents % 300 == 0)  // every 10 s at 30 fps, also in the menus (before the upscaler starts)
+                    Log("[fps] lock at %d fps (every %llu refreshes of %.3f ms): frames %llu, %llu late; refreshes "
+                        "between frames 1: %llu, 2: %llu, 3: %llu, 4+: %llu; game thread held %.2f ms per frame",
+                        g_cfg.fpsLimit, (unsigned long long)n, R / 1e6, (unsigned long long)L.presents,
+                        (unsigned long long)L.lateFrames, (unsigned long long)L.gaps[0], (unsigned long long)L.gaps[1],
+                        (unsigned long long)L.gaps[2], (unsigned long long)L.gaps[3],
+                        L.sleptNs / 1e6 / (double)L.presents);
+            }
+        }
+    }
+    if (sleepUntil) {
+        uint64_t now = NowNs();
+        if (sleepUntil > now) {
+            uint64_t ns = std::min<uint64_t>(sleepUntil - now, 100000000);  // never more than 100 ms
+            std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+            TLock lk(g_t);
+            g_fpsLock.sleptNs += ns;
+        }
+    }
+    return d->QueuePresentKHR(queue, pInfo);
+}
+
 struct FrameGen {
     // the swapchain, set up at creation when frame_gen=1 (transfer usage, 3 images, FIFO)
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -5026,7 +5106,7 @@ void FgSkip(uint64_t frame, const char* why) {  // caller holds g_t
 VkResult FgPresent(DeviceData* d, VkQueue queue, const VkPresentInfoKHR* pInfo, uint64_t frame, bool upscaled) {
     const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, PRESENT = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    auto passThrough = [&] { return d->QueuePresentKHR(queue, pInfo); };
+    auto passThrough = [&] { return PacedPresent(d, queue, pInfo); };
     uint32_t slot = 0, gameIndex = 0, w = 0, h = 0;
     VkImage outImage = VK_NULL_HANDLE, depth = VK_NULL_HANDLE, motion = VK_NULL_HANDLE, gameImage = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -7010,6 +7090,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, co
             forFg = true;
         }
     }
+    if (g_cfg.fpsLimit > 0) ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always supported
 #endif
     VkResult r = d->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
     if (r != VK_SUCCESS && forFg) {  // try again as the game asked
@@ -7046,6 +7127,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, co
             }
         } else if (g_cfg.frameGen)
             Log("[fg] swapchain not set up for frame generation: %s", fgWhy.empty() ? "creation failed" : fgWhy.c_str());
+        FpsLockSwapchain(*pSwapchain, g_cfg.fpsLimit > 0 && ci.presentMode == VK_PRESENT_MODE_FIFO_KHR && !forFg);
 #endif
     }
     return r;

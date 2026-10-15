@@ -1,6 +1,8 @@
 // MetalFX Temporal bridge (see metalfx_bridge.h). Built with ARC.
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
+#import <CoreVideo/CoreVideo.h>
+#include <mach/mach_time.h>
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/IOKitLib.h>
@@ -347,6 +349,45 @@ bool mfx_fg_encode(int slot, const MfxFgFrame* f, char* err, int errLen) {
 
 bool mfx_key_down(int macKeyCode) {
     return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, (CGKeyCode)macKeyCode);
+}
+
+namespace {
+std::atomic<uint64_t> g_vsyncNs{0}, g_vsyncPeriodNs{0};
+uint64_t HostToNs(uint64_t host) {
+    static mach_timebase_info_data_t tb = [] {
+        mach_timebase_info_data_t t{};
+        mach_timebase_info(&t);
+        return t;
+    }();
+    return host * tb.numer / tb.denom;
+}
+CVReturn VsyncCallback(CVDisplayLinkRef, const CVTimeStamp* now, const CVTimeStamp*, CVOptionFlags, CVOptionFlags*,
+                       void*) {
+    if (now->flags & kCVTimeStampHostTimeValid) g_vsyncNs.store(HostToNs(now->hostTime), std::memory_order_release);
+    if ((now->flags & kCVTimeStampVideoRefreshPeriodValid) && now->videoTimeScale > 0)
+        g_vsyncPeriodNs.store((uint64_t)((double)now->videoRefreshPeriod * 1e9 / (double)now->videoTimeScale),
+                              std::memory_order_release);
+    return kCVReturnSuccess;
+}
+}  // namespace
+
+bool mfx_vsync(uint64_t* lastVsyncNs, uint64_t* periodNs) {
+    static CVDisplayLinkRef link = [] {
+        CVDisplayLinkRef l = nullptr;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"  // CVDisplayLink: deprecated in macOS 15, still works
+        if (CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &l) == kCVReturnSuccess && l) {
+            CVDisplayLinkSetOutputCallback(l, VsyncCallback, nullptr);
+            CVDisplayLinkStart(l);
+        }
+#pragma clang diagnostic pop
+        return l;
+    }();
+    uint64_t v = g_vsyncNs.load(std::memory_order_acquire), p = g_vsyncPeriodNs.load(std::memory_order_acquire);
+    if (!link || !v || p < 1000000) return false;
+    *lastVsyncNs = v;
+    *periodNs = p;
+    return true;
 }
 
 bool mfx_app_focused(void) {

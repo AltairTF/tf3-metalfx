@@ -22,7 +22,7 @@ optional `upscale_to` cap. Frame generation (`frame_gen=1`) stays experimental a
   2.4-3.3 ms, the reactive mask 0.6-0.8 ms, sharpening ~0.5 ms, motion vectors ~0.1 ms.
 - Open: the game presents with VK_PRESENT_MODE_IMMEDIATE (no vsync) and its frame time moves between 21 and
   27 ms, so on a 60 Hz screen without VRR frames stay up for 1 or 2 refreshes unevenly (judder) and can tear.
-  Next step: a 30 fps lock (every frame exactly 2 refreshes), see "Next: 30 fps lock" at the end.
+  `fps_limit=30` (every frame exactly 2 refreshes) addresses it; see "Frame rate lock" at the end.
 
 ## How the layer gets loaded on macOS
 On Windows a `version.dll` stand-in enables the layer. macOS needs no proxy, because the Vulkan loader
@@ -355,13 +355,23 @@ MIT source (AMD FidelityFX, Dear ImGui).
   threads' CPU, and a verdict (GPU, one game thread, or the 60 Hz display).
 - Harness manifest fix: the layer library is .dylib on macOS.
 
-## Next: 30 fps lock (planned)
+## Frame rate lock: fps_limit (2026-10-15, verified outside the game and in game)
 At 37-47 fps on a 60 Hz screen without VRR, frames are shown for 1 or 2 refreshes in an uneven pattern, which
-looks like jumps; with IMMEDIATE present it can also tear. Locking to 30 fps shows every frame for exactly 2
-refreshes: even motion and no tearing, at the cost of a lower frame rate and about one more frame of latency. The
-M4 has headroom for it (frame time 21-27 ms against 33.3 ms). Plan: first check whether the game has its own
-frame limit / vsync setting (settings.lua); otherwise a `fps_limit=30` option in the layer: FIFO present mode
-at swapchain creation (as frame_gen does) plus pacing at vkQueuePresentKHR (wait until 33.3 ms after the last
-present, or VK_GOOGLE_display_timing if MoltenVK honours it). Check in game: frame-time spread in the perf=1
-report and the look of a slow pan.
-
+looks like jumps; the game presents with IMMEDIATE, so it can also tear. TF3 has no frame limit or vsync option.
+`fps_limit=30` (layer.cpp "Frame rate lock", off by default, needs a restart): the swapchain is created with FIFO,
+and at each present (PacedPresent, when frame generation is off) the layer sleeps until half a refresh before the
+refresh n after the previous frame's (n = refresh rate / fps_limit = 2), then hands the frame over; FIFO shows it
+at that refresh. The refresh grid comes from a CVDisplayLink on the main display (mfx_vsync in the bridge). The
+sleep also holds the game's thread, so it can't run ahead. A late frame goes out at once and takes the first
+refresh it can still make.
+- Tried first and dropped: VK_GOOGLE_display_timing (MoltenVK has it). In a test window presentAtTime wasn't
+  honoured (frames reached the screen ~24 ms before the asked time; the pacing then drifted to 29.2 fps), and the
+  "actual" present times are the hand-over times (~1 ms after the present), not refreshes.
+- Test (scratchpad fpstest: a 480x270 Cocoa window on the game's loader + MoltenVK with the layer, CPU work 21-27
+  ms per frame like TF3, IMMEDIATE asked): 30.0 fps; 599 of 599 frames 2 refreshes after the previous one, 0
+  late; the game thread waits ~7 ms per frame. With 30-36 ms frames (below 30 fps) it falls to a 2/3-refresh mix
+  (24.4 fps, 45% late): the lock needs the game to hold 30 fps.
+- Log: `[fps]` every 300 frames (frames, late, refreshes between frames, time the game thread was held).
+- 2026-10-15 IN-GAME RESULT (fps_limit=30, 60 Hz LG UltraFine): 6299 frames locked, 6146 (97.6%) exactly 2
+  refreshes after the previous one, 121 after 3 and 31 after 4 or more (loading and busy moments), 134 late. The
+  user accepted it ("ok, done then"). The info box is off by default again (overlay=0 in every cfg).

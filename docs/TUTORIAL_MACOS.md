@@ -84,6 +84,9 @@ Depois siga os passos 3 e 4 da seção anterior.
     `reactive_debug=1` pinta de vermelho onde a máscara age. Custa ~0,7 ms no M4.
   - `upscale_to=1080`: o MetalFX gera no máximo essa altura e o jogo estica o resto; a interface
     continua na resolução da tela (útil numa tela 4K com escala baixa).
+  - `fps_limit=30`: trava o jogo em 30 fps com vsync. Numa tela de 60 Hz cada frame fica exatamente
+    2 atualizações na tela, então o movimento fica regular (sem os pulos e o tearing de 37-47 fps).
+    Acrescenta ~1 frame de atraso. Vale após reiniciar o jogo; 0 desliga.
   - `frame_gen=1` (experimental): geração de frames, explicada logo abaixo. Vale após reiniciar o jogo.
 
 ### Geração de frames (experimental)
@@ -283,7 +286,7 @@ Elas podem ir num arquivo `launch.env` ao lado do `launch.sh` (uma `VAR=valor` p
   reduz o rastro deles, mas nesses pontos a imagem fica um pouco menos suave.
 - Nuvens e outros efeitos de tela inteira recebem só o movimento da câmera.
 - O jogo apresenta os frames sem vsync: a 37-47 fps numa tela de 60 Hz o movimento fica irregular.
-  Um limite de 30 fps está planejado.
+  `fps_limit=30` resolve isso enquanto o jogo aguentar 30 fps; abaixo disso volta a variar.
 - O MetalFX custa ~3,4 ms de GPU por frame no M4 base a 50% (cerca de 15% do frame a 40 fps).
   Chips Pro/Max devem ter folga bem maior.
 - Experimental: use por sua conta. Para voltar ao normal, basta apagar a opção de inicialização.

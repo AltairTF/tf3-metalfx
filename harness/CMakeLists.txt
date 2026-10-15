@@ -67,7 +67,7 @@ if(NOT WIN32)
     target_include_directories(VkLayer_tf3_dlss PRIVATE "${LAYER_DIR}/../macos")
     target_compile_definitions(VkLayer_tf3_dlss PRIVATE VK_USE_PLATFORM_METAL_EXT)
     target_link_libraries(VkLayer_tf3_dlss PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation"
-                          "-framework AppKit" "-framework CoreGraphics" "-framework IOKit")
+                          "-framework AppKit" "-framework CoreGraphics" "-framework IOKit" "-framework CoreVideo")
   endif()
   target_include_directories(VkLayer_tf3_dlss PRIVATE "${DLSS_SDK}/include" "${GEN_DIR}"
                              "${LAYER_DIR}/../third_party/ffx-api/include")
