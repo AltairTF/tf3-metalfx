@@ -62,6 +62,41 @@ float mfx_gpu_ms(void);
 // Since the last call, for the perf=1 report: median, total and slowest ms, and how many command buffers.
 void mfx_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count);
 
+// Frame generation with MTLFXFrameInterpolator (macOS 26+). It runs at the game's present: from this frame's
+// upscaled image (no UI), the last one, depth and motion it makes the frame halfway between them. The UI comes
+// from a copy of the finished frame: with uiComposited, MetalFX separates the UI from the image below it.
+bool mfx_fg_supported(void);
+// (Re)creates the interpolator. Depth / motion inW x inH (R32 float / RG16 float), colour outW x outH RGBA8,
+// UI and output outW x outH in the swapchain's format (BGRA8 or RGBA8 unorm, as a VkFormat).
+bool mfx_fg_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t swapVkFormat, char* err,
+                      int errLen);
+
+struct MfxFgFrame {
+    void* color;      // this frame without UI (the upscaler's output)
+    void* prevColor;  // the last frame without UI
+    void* depth;
+    void* motion;
+    void* ui;         // this frame as shown, UI included
+    void* output;     // the frame in between
+    void* eventIn;
+    uint64_t waitValue;
+    void* eventOut;
+    uint64_t signalValue;
+    float jitterX, jitterY;  // pixels
+    float mvScaleX, mvScaleY;
+    float deltaTime;         // seconds between the last frame and this one
+    float nearPlane, farPlane, fovDegrees, aspect;
+    bool reset;
+    bool depthReversed;
+};
+// Encodes wait(in) -> interpolation -> signal(out) on our queue and commits it. If the interpolator can't
+// run, it copies "ui" to "output" (the frame is shown twice) and still signals "out". False on error.
+bool mfx_fg_encode(int slot, const MfxFgFrame* f, char* err, int errLen);
+void mfx_fg_slot_wait(int slot);
+// GPU time of the interpolation command buffers, like mfx_gpu_ms / mfx_gpu_window.
+float mfx_fg_gpu_ms(void);
+void mfx_fg_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count);
+
 // Debug hotkeys on macOS (debug_keys=1): is this macOS virtual key held, and is our process the frontmost app.
 bool mfx_key_down(int macKeyCode);
 bool mfx_app_focused(void);

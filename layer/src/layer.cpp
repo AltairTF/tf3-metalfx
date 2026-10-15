@@ -319,6 +319,7 @@ struct Config {
     float motionThreshold = 0.f;    // output pixels per frame below which nothing is added
     float motionLimit = 10.f;       // output pixels per frame where the full motionSharpness applies
     int sharpenDebug = 0;       // 1 = tint where motion changes the sharpening (red = more)
+    int frameGen = 0;           // macOS: 1 = MetalFX frame interpolation, one generated frame per game frame
     float fsrSharpness = 0.5f;  // FSR's own sharpening (RCAS), 0..1 (0 = off)
     int overlay = 0;            // 1 = on-screen info box (upscaler, sizes, sharpness, jitter)
     float overlayX = 25.f;      // its top-left corner, percent of the screen from the left ...
@@ -436,6 +437,7 @@ bool LoadConfig() {
         else if (k == "perf") c.perf = iv;
         else if (k == "perf_seconds") c.perfSeconds = std::min(std::max(fv, 1.f), 60.f);
         else if (k == "skip_game_fsr") c.skipGameFsr = iv;
+        else if (k == "frame_gen") c.frameGen = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
@@ -443,13 +445,13 @@ bool LoadConfig() {
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
         "perf_seconds=%g skip_game_fsr=%d sharpen_type=%s motion_sharpness=%g motion_threshold=%g motion_limit=%g "
-        "sharpen_debug=%d",
+        "sharpen_debug=%d frame_gen=%d",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
         c.perf, c.perfSeconds, c.skipGameFsr, c.sharpenType == 1 ? "cas" : "rcas", c.motionSharpness,
-        c.motionThreshold, c.motionLimit, c.sharpenDebug);
+        c.motionThreshold, c.motionLimit, c.sharpenDebug, c.frameGen);
     if (c.motionLimit <= c.motionThreshold)
         Log("[cfg] motion_limit (%g) should be above motion_threshold (%g)", c.motionLimit, c.motionThreshold);
     return true;
@@ -525,7 +527,10 @@ struct InstanceData {
     X(CmdSetScissor)                          \
     X(CreateSampler)                          \
     X(QueueSubmit)                            \
-    X(QueuePresentKHR)
+    X(QueuePresentKHR)                        \
+    X(GetDeviceQueue)                         \
+    X(GetDeviceQueue2)                        \
+    X(DestroySwapchainKHR)
 
 // ... and functions we only call ourselves.
 #define DEVICE_CALLS(X)            \
@@ -569,6 +574,7 @@ struct DeviceData {
 std::mutex g_lock;
 std::unordered_map<void*, InstanceData> g_instances;
 std::unordered_map<void*, DeviceData> g_devices;
+std::unordered_map<VkQueue, uint32_t> g_queueFamily;  // from vkGetDeviceQueue(2), under g_lock
 
 InstanceData* GetInstance(void* key) {
     std::lock_guard<std::mutex> lk(g_lock);
@@ -1049,6 +1055,12 @@ namespace ViewOff {
 constexpr size_t projView = 0, projViewInverse = 64, proj = 128, view = 256, camPos = 384, near_ = 416,
                  far_ = 420, width = 428, height = 432, fov = 456;
 }
+
+// This frame's scene camera, for MetalFX frame interpolation (taken when the motion vectors are uploaded).
+struct FrameCamera {
+    uint64_t frame = UINT64_MAX;
+    float nearPlane = 0.f, farPlane = 0.f, fovYDegrees = 0.f, aspect = 0.f;
+} g_frameCam;
 
 void MatMul(const float* a, const float* b, float* out) {  // column-major: out = a * b
     for (int c = 0; c < 4; ++c)
@@ -2132,6 +2144,16 @@ void UploadMvMatrices(const CmdState& cs) {
         }
         float pv[16], cam[3];  // the camera data is never jittered (jitter goes through the viewport)
         std::memcpy(pv, v + ViewOff::projView, 64);
+        {
+            float proj[16];
+            std::memcpy(proj, v + ViewOff::proj, 64);
+            std::memcpy(&g_frameCam.nearPlane, v + ViewOff::near_, 4);
+            std::memcpy(&g_frameCam.farPlane, v + ViewOff::far_, 4);
+            float sy = std::fabs(proj[5]), sx = std::fabs(proj[0]);  // 1 / tan(fov / 2), per axis
+            g_frameCam.fovYDegrees = sy > 0.f ? 2.f * std::atan(1.f / sy) * 57.29578f : 0.f;
+            g_frameCam.aspect = sx > 0.f ? sy / sx : 0.f;
+            g_frameCam.frame = g_frame;
+        }
         std::memcpy(u.curInvViewProj, v + ViewOff::projViewInverse, 64);
         std::memcpy(cam, v + ViewOff::camPos, 12);
         g_traceViewBuf = cs.viewBuf;
@@ -3380,6 +3402,7 @@ void PerfReset() {
     g_gpu.frames = g_gpu.gameFsrFrames = 0;
 #ifdef __APPLE__
     mfx_gpu_window(nullptr, nullptr, nullptr, nullptr);  // MetalFX's own GPU times: start a new window too
+    mfx_fg_gpu_window(nullptr, nullptr, nullptr, nullptr);
 #endif
 }
 
@@ -3475,6 +3498,13 @@ void PerfPresent() {
             mfxMed, 100.0 * mfxMed / avg, mfxSum / mfxN, mfxMax, mfxN, g_dlss.inW, g_dlss.inH, g_dlss.outW,
             g_dlss.outH);
     }
+    double fgMed = 0.0, fgSum = 0.0, fgMax = 0.0;
+    uint32_t fgN = 0;
+    mfx_fg_gpu_window(&fgMed, &fgSum, &fgMax, &fgN);
+    if (fgN)
+        Log("[perf]   frame generation GPU: %.3f ms per generated frame (median, %.1f%% of the game's frame); mean "
+            "%.3f, slowest %.3f ms, %u frames generated",
+            fgMed, 100.0 * fgMed / avg, fgSum / fgN, fgMax, fgN);
 #endif
     char ov[96];
     if (g_gpu.frames)
@@ -3629,6 +3659,10 @@ bool EnsureOverlay(DeviceData* d) {
 }
 
 // The info box's lines for this frame.
+#ifdef __APPLE__
+bool FgActive();
+#endif
+
 std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint32_t inW, uint32_t inH) {
     char b[kOvLines][96];
     bool fsr = backend == Backend::Fsr;
@@ -3645,6 +3679,13 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
         size_t n = std::strlen(b[1]);
         std::snprintf(b[1] + n, sizeof b[1] - n, "  GPU %.1f MS", mfx_gpu_ms());
     }
+    bool fg = FgActive();
+    if (fg) {
+        size_t n = std::strlen(b[1]);
+        std::snprintf(b[1] + n, sizeof b[1] - n, "  FG %.1f MS", mfx_fg_gpu_ms());
+    }
+#else
+    const bool fg = false;
 #endif
     if (fsr) std::snprintf(b[2], sizeof b[2], "SHARPNESS %.1f (FSR RCAS)  [CTRL+SHIFT+UP/DOWN]", g_cfg.fsrSharpness);
     else if (g_cfg.motionSharpness != 0.f)
@@ -3661,8 +3702,11 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
                   !g_cfg.motionVectors ? "OFF                     [M]"
                   : g_cfg.objectMotion ? "CAMERA + OBJECTS        [M]"
                                        : "CAMERA ONLY             [M]");
-    std::snprintf(b[5], sizeof b[5], "FPS %.0f (%.1f MS)  [U]SWITCH [D]OFF [O]HIDE", g_fps,
-                  g_fps > 0.f ? 1000.f / g_fps : 0.f);
+    if (fg)
+        std::snprintf(b[5], sizeof b[5], "FPS %.0f -> %.0f SHOWN  [F]FG [D]OFF [O]HIDE", g_fps, 2.f * g_fps);
+    else
+        std::snprintf(b[5], sizeof b[5], "FPS %.0f (%.1f MS)  [U]SWITCH [D]OFF [O]HIDE", g_fps,
+                      g_fps > 0.f ? 1000.f / g_fps : 0.f);
     std::snprintf(b[6], sizeof b[6], "%s", g_pw.overlayLine.c_str());
     return std::vector<std::string>(std::begin(b), std::begin(b) + (g_cfg.perf ? 7 : 6));
 }
@@ -3808,6 +3852,10 @@ struct MetalFx {
     VkFormat confFmt = VK_FORMAT_UNDEFINED;
     bool deviceExtEnabled = false;  // VK_EXT_metal_objects was enabled at device creation
     int encodeErrors = 0;
+    // the last frame recorded, for frame generation at present
+    uint64_t lastFrame = UINT64_MAX;
+    float lastJx = 0.f, lastJy = 0.f;
+    bool lastReset = false;
 } g_mfx;
 
 void* MtlTexture(DeviceData* d, VkImage img) {
@@ -3962,6 +4010,10 @@ bool RecordMetalFx(DeviceData* d, VkCommandBuffer cb, CmdState& cs, const ImageI
     cs.mfxReset = g_dlss.resetNext;
     cs.mfxInW = ci.w;
     cs.mfxInH = ci.h;
+    g_mfx.lastFrame = g_frame;
+    g_mfx.lastJx = cs.mfxJx;
+    g_mfx.lastJy = cs.mfxJy;
+    g_mfx.lastReset = cs.mfxReset;
     return true;
 }
 
@@ -4012,6 +4064,570 @@ void MfxCommit(MfxJob& job, bool submitted) {
         if (g_mfx.encodeErrors++ < 5) Log("[mfx] encode failed: %s", err);
         mfx_event_set(job.frame.eventOut, job.frame.signalValue);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frame generation (frame_gen=1): MetalFX frame interpolation at present
+// ---------------------------------------------------------------------------------------------
+// At the present of each upscaled frame N, the layer acquires a second swapchain image, has MetalFX make the
+// frame halfway between N-1 and N in it, and presents it before N. One command buffer of ours, on the game's
+// queue, waits for the game's frame (the present's semaphores), copies the finished frame (UI included) for
+// MetalFX, hands over to MetalFX through a VkEvent pair as the upscaler does, copies the result into the
+// extra image and keeps this frame's upscaled image for the next interpolation. MetalFX gets the image
+// without UI (the upscaler's output, which the game's blit copies to the screen before drawing its UI) and
+// the finished frame, and takes the UI out of the latter itself (uiTextureComposited).
+// With FIFO presentation the two images are shown at successive refreshes, so the game runs at most at half
+// the refresh rate: 30 fps -> 60 on a 60 Hz display.
+constexpr int kFgSlots = 8;  // must match metalfx_bridge.mm
+struct FrameGen {
+    // the swapchain, set up at creation when frame_gen=1 (transfer usage, 3 images, FIFO)
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkFormat swapFmt = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+    std::vector<VkImage> swapImages;
+    // our objects
+    bool tried = false, ready = false;
+    std::string why = "not set up";
+    uint32_t family = UINT32_MAX;
+    PFN_vkCreateCommandPool createCommandPool = nullptr;
+    PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
+    PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
+    PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
+    PFN_vkCreateFence createFence = nullptr;
+    PFN_vkDestroyFence destroyFence = nullptr;
+    PFN_vkWaitForFences waitForFences = nullptr;
+    PFN_vkResetFences resetFences = nullptr;
+    PFN_vkCreateSemaphore createSemaphore = nullptr;
+    PFN_vkDestroySemaphore destroySemaphore = nullptr;
+    PFN_vkAcquireNextImageKHR acquireNextImage = nullptr;
+    PFN_vkGetSwapchainImagesKHR getSwapchainImages = nullptr;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cb[kFgSlots] = {};
+    VkFence fence[kFgSlots] = {};
+    bool fenceUsed[kFgSlots] = {};
+    VkSemaphore semAcquire[kFgSlots] = {}, semGen[kFgSlots] = {}, semGame[kFgSlots] = {};
+    VkEvent evIn[kFgSlots] = {}, evOut[kFgSlots] = {};
+    void* mtlIn[kFgSlots] = {};
+    void* mtlOut[kFgSlots] = {};
+    uint64_t counter = 0;
+    // the finished frame (UI included), the last upscaled frame, the generated frame
+    VkImage uiImage = VK_NULL_HANDLE, prevImage = VK_NULL_HANDLE, genImage = VK_NULL_HANDLE;
+    VkImageView uiView = VK_NULL_HANDLE, prevView = VK_NULL_HANDLE, genView = VK_NULL_HANDLE;
+    VkFormat imgFmt = VK_FORMAT_UNDEFINED;
+    uint32_t w = 0, h = 0;
+    bool genInGeneral = false;
+    uint32_t confInW = 0, confInH = 0;  // the interpolator's depth / motion size
+    // history
+    bool havePrev = false;
+    uint64_t prevFrame = UINT64_MAX;  // g_frame of the upscaled image in prevImage
+    std::chrono::steady_clock::time_point prevTime;
+    // counters, for the log and the overlay
+    uint64_t generated = 0, skipped = 0;
+    std::string skipWhy;
+    int errors = 0;
+    // TF3_FG_DUMP (test harness): readback of the previous frame, the generated one and the finished one
+    VkBuffer dumpBuf[3] = {};
+    char* dumpPtr[3] = {};
+    bool dumpFailed = false;
+    uint64_t dumpKeyFrame = UINT64_MAX;  // Ctrl+Shift+G: dump this frame and the next
+} g_fg;
+
+// TF3_FG_DUMP=150,151: write the frames around these frames' generated frames to the capture folder. With
+// TF3_DLSS_CAPTURE_REL=1 the numbers count from the first frame with the game's FSR pass, as for TF3_DLSS_CAPTURE.
+bool FgDumpAt(uint64_t frame) {
+    if (g_fg.dumpKeyFrame != UINT64_MAX && (frame == g_fg.dumpKeyFrame || frame == g_fg.dumpKeyFrame + 1)) return true;
+    static const bool rel = [] {
+        const char* e = std::getenv("TF3_DLSS_CAPTURE_REL");
+        return e && *e == '1';
+    }();
+    if (rel) {
+        if (!g_firstFsrFrame || frame < g_firstFsrFrame) return false;
+        frame -= g_firstFsrFrame;
+    }
+    static std::vector<uint64_t> frames = [] {
+        std::vector<uint64_t> v;
+        const char* e = std::getenv("TF3_FG_DUMP");
+        for (const char* p = e; p && *p;) {
+            char* end = nullptr;
+            unsigned long long f = std::strtoull(p, &end, 10);
+            if (end == p) break;
+            v.push_back(f);
+            p = *end ? end + 1 : end;
+        }
+        return v;
+    }();
+    return std::find(frames.begin(), frames.end(), frame) != frames.end();
+}
+
+// Writes w x h 4-byte pixels as PPM (bgra: blue first in memory).
+void FgWritePpm(const std::filesystem::path& path, const char* px, uint32_t w, uint32_t h, bool bgra) {
+    std::ofstream o(path, std::ios::binary);
+    o << "P6\n" << w << " " << h << "\n255\n";
+    std::vector<char> row((size_t)w * 3);
+    for (uint32_t y = 0; y < h; ++y) {
+        const char* src = px + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; ++x) {
+            row[x * 3 + 0] = src[x * 4 + (bgra ? 2 : 0)];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + (bgra ? 0 : 2)];
+        }
+        o.write(row.data(), (std::streamsize)row.size());
+    }
+}
+
+// Is frame generation set up and switched on (for the overlay). Caller holds g_t.
+bool FgActive() { return g_cfg.frameGen && g_fg.ready && g_fg.swapchain && g_fg.generated > 0; }
+
+void FgDestroyImages(DeviceData* d) {
+    for (VkImageView* v : {&g_fg.uiView, &g_fg.prevView, &g_fg.genView})
+        if (*v) d->DestroyImageView(d->device, *v, nullptr), *v = VK_NULL_HANDLE;
+    for (VkImage* i : {&g_fg.uiImage, &g_fg.prevImage, &g_fg.genImage})
+        if (*i) d->DestroyImage(d->device, *i, nullptr), *i = VK_NULL_HANDLE;
+    g_fg.w = g_fg.h = 0;
+    g_fg.havePrev = false;
+    g_fg.genInGeneral = false;
+}
+
+// Once per device: command pool, per-slot command buffers, fences, semaphores, events. Caller holds g_t.
+bool FgEnsure(DeviceData* d, VkQueue queue) {
+    if (g_fg.ready) return true;
+    if (g_fg.tried) return false;
+    g_fg.tried = true;
+    if (!MfxEnsure(d)) {
+        g_fg.why = "MetalFX isn't running (" + g_mfx.why + ")";
+        return false;
+    }
+    if (!mfx_fg_supported()) {
+        g_fg.why = "MetalFX frame interpolation needs macOS 26 and a GPU that supports it";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_lock);
+        auto it = g_queueFamily.find(queue);
+        if (it != g_queueFamily.end()) g_fg.family = it->second;
+    }
+    if (g_fg.family == UINT32_MAX) {
+        g_fg.why = "the present queue's family is unknown";
+        return false;
+    }
+    auto gdpa = d->GetDeviceProcAddr;
+#define FG_FN(field, name) g_fg.field = (decltype(g_fg.field))gdpa(d->device, name);
+    FG_FN(createCommandPool, "vkCreateCommandPool")
+    FG_FN(destroyCommandPool, "vkDestroyCommandPool")
+    FG_FN(allocateCommandBuffers, "vkAllocateCommandBuffers")
+    FG_FN(endCommandBuffer, "vkEndCommandBuffer")
+    FG_FN(createFence, "vkCreateFence")
+    FG_FN(destroyFence, "vkDestroyFence")
+    FG_FN(waitForFences, "vkWaitForFences")
+    FG_FN(resetFences, "vkResetFences")
+    FG_FN(createSemaphore, "vkCreateSemaphore")
+    FG_FN(destroySemaphore, "vkDestroySemaphore")
+    FG_FN(acquireNextImage, "vkAcquireNextImageKHR")
+#undef FG_FN
+    if (!g_fg.createCommandPool || !g_fg.allocateCommandBuffers || !g_fg.endCommandBuffer || !g_fg.createFence ||
+        !g_fg.waitForFences || !g_fg.resetFences || !g_fg.createSemaphore || !g_fg.acquireNextImage) {
+        g_fg.why = "Vulkan functions missing";
+        return false;
+    }
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = g_fg.family;
+    if (g_fg.createCommandPool(d->device, &pci, nullptr, &g_fg.pool) != VK_SUCCESS) {
+        g_fg.why = "vkCreateCommandPool failed";
+        return false;
+    }
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = g_fg.pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = kFgSlots;
+    if (g_fg.allocateCommandBuffers(d->device, &ai, g_fg.cb) != VK_SUCCESS) {
+        g_fg.why = "vkAllocateCommandBuffers failed";
+        return false;
+    }
+    for (int i = 0; i < kFgSlots; ++i) {
+        // Command buffers we allocate ourselves don't get the loader's dispatch pointer: set it.
+        *reinterpret_cast<void**>(g_fg.cb[i]) = *reinterpret_cast<void**>(d->device);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        if (g_fg.createFence(d->device, &fi, nullptr, &g_fg.fence[i]) != VK_SUCCESS ||
+            g_fg.createSemaphore(d->device, &si, nullptr, &g_fg.semAcquire[i]) != VK_SUCCESS ||
+            g_fg.createSemaphore(d->device, &si, nullptr, &g_fg.semGen[i]) != VK_SUCCESS ||
+            g_fg.createSemaphore(d->device, &si, nullptr, &g_fg.semGame[i]) != VK_SUCCESS ||
+            g_mfx.createEvent(d->device, &ei, nullptr, &g_fg.evIn[i]) != VK_SUCCESS ||
+            g_mfx.createEvent(d->device, &ei, nullptr, &g_fg.evOut[i]) != VK_SUCCESS) {
+            g_fg.why = "could not create fences, semaphores or events";
+            return false;
+        }
+        for (int k = 0; k < 2; ++k) {
+            VkExportMetalSharedEventInfoEXT se{VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT};
+            se.event = k ? g_fg.evOut[i] : g_fg.evIn[i];
+            VkExportMetalObjectsInfoEXT o{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+            o.pNext = &se;
+            g_mfx.exportObjects(d->device, &o);
+            (k ? g_fg.mtlOut : g_fg.mtlIn)[i] = (void*)se.mtlSharedEvent;
+        }
+        if (!g_fg.mtlIn[i] || !g_fg.mtlOut[i]) {
+            g_fg.why = "MoltenVK's VkEvents are not MTLSharedEvents on this GPU";
+            return false;
+        }
+    }
+    g_fg.ready = true;
+    g_fg.why = "ready";
+    Log("[fg] frame generation ready (queue family %u, %d slots)", g_fg.family, kFgSlots);
+    return true;
+}
+
+void FgDestroy(DeviceData* d) {
+    if (!g_fg.tried) return;
+    for (int i = 0; i < kFgSlots; ++i) mfx_fg_slot_wait(i);
+    FgDestroyImages(d);
+    for (int i = 0; i < kFgSlots; ++i) {
+        if (g_fg.fence[i] && g_fg.destroyFence) g_fg.destroyFence(d->device, g_fg.fence[i], nullptr);
+        for (VkSemaphore s : {g_fg.semAcquire[i], g_fg.semGen[i], g_fg.semGame[i]})
+            if (s && g_fg.destroySemaphore) g_fg.destroySemaphore(d->device, s, nullptr);
+        for (VkEvent e : {g_fg.evIn[i], g_fg.evOut[i]})
+            if (e && g_mfx.destroyEvent) g_mfx.destroyEvent(d->device, e, nullptr);
+    }
+    if (g_fg.pool && g_fg.destroyCommandPool) g_fg.destroyCommandPool(d->device, g_fg.pool, nullptr);
+    g_fg = FrameGen{};
+}
+
+// Images at the swapchain's size, and the interpolator for this render size. Caller holds g_t.
+bool FgEnsureImages(DeviceData* d, uint32_t inW, uint32_t inH) {
+    uint32_t w = g_fg.extent.width, h = g_fg.extent.height;
+    if (!g_fg.uiImage || g_fg.w != w || g_fg.h != h || g_fg.imgFmt != g_fg.swapFmt) {
+        if (g_fg.uiImage) {
+            d->DeviceWaitIdle(d->device);
+            FgDestroyImages(d);
+        }
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!CreateOwnImage(d, w, h, g_fg.swapFmt, u, &g_fg.uiImage, &g_fg.uiView) ||
+            !CreateOwnImage(d, w, h, VK_FORMAT_R8G8B8A8_UNORM, u, &g_fg.prevImage, &g_fg.prevView) ||
+            !CreateOwnImage(d, w, h, g_fg.swapFmt,  // MetalFX writes it as a render target
+                            u | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &g_fg.genImage,
+                            &g_fg.genView)) {
+            FgDestroyImages(d);
+            g_fg.ready = false;
+            g_fg.why = "could not create the frame generation images";
+            Log("[fg] %s", g_fg.why.c_str());
+            return false;
+        }
+        g_fg.w = w;
+        g_fg.h = h;
+        g_fg.imgFmt = g_fg.swapFmt;
+        g_fg.confInW = g_fg.confInH = 0;
+    }
+    if (g_fg.confInW != inW || g_fg.confInH != inH) {
+        char err[256] = {};
+        if (!mfx_fg_configure(inW, inH, w, h, (uint32_t)g_fg.swapFmt, err, sizeof err)) {
+            g_fg.ready = false;
+            g_fg.why = err;
+            Log("[fg] interpolator setup failed: %s", err);
+            return false;
+        }
+        g_fg.confInW = inW;
+        g_fg.confInH = inH;
+        g_fg.havePrev = false;
+        Log("[fg] frame interpolator: depth and motion %ux%u, frames %ux%u (%s)", inW, inH, w, h,
+            FormatName(g_fg.swapFmt) ? FormatName(g_fg.swapFmt) : "?");
+    }
+    return true;
+}
+
+void FgBarrier(DeviceData* d, VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+               VkAccessFlags srcAccess, VkAccessFlags dstAccess) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.image = img;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                          nullptr, 1, &b);
+}
+
+void FgCopy(DeviceData* d, VkCommandBuffer cb, VkImage src, VkImage dst, uint32_t w, uint32_t h) {
+    VkImageCopy c{};
+    c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.extent = {w, h, 1};
+    d->CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+}
+
+void FgSkip(uint64_t frame, const char* why) {  // caller holds g_t
+    ++g_fg.skipped;
+    if (g_fg.skipWhy != why) {
+        g_fg.skipWhy = why;
+        Log("[fg] frame %llu: no generated frame: %s", (unsigned long long)frame, why);
+    }
+}
+
+// Called at present instead of the next layer's vkQueuePresentKHR. frame: the number of the frame being
+// presented (g_frame has moved on by then); upscaled: its upscaled image was swapped into the blit.
+VkResult FgPresent(DeviceData* d, VkQueue queue, const VkPresentInfoKHR* pInfo, uint64_t frame, bool upscaled) {
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, PRESENT = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    auto passThrough = [&] { return d->QueuePresentKHR(queue, pInfo); };
+    uint32_t slot = 0, gameIndex = 0, w = 0, h = 0;
+    VkImage outImage = VK_NULL_HANDLE, depth = VK_NULL_HANDLE, motion = VK_NULL_HANDLE, gameImage = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    std::vector<VkImage> swapImages;
+    bool dump = false, dumpPrev = false;
+    MfxFgFrame job{};
+    auto now = std::chrono::steady_clock::now();
+    // Under g_t: decide, and gather what this frame needs. The presents themselves run without the lock
+    // (FIFO presentation and the acquire can block until the screen refreshes).
+    auto prepare = [&]() -> bool {
+        if (!g_cfg.frameGen) {
+            g_fg.havePrev = false;
+            return false;
+        }
+        if (!g_fg.swapchain) {
+            FgSkip(frame, "the swapchain wasn't set up for it (frame_gen=1 needs a restart of the game)");
+            return false;
+        }
+        if (pInfo->swapchainCount != 1 || pInfo->pSwapchains[0] != g_fg.swapchain) {
+            FgSkip(frame, "this present isn't for the game's swapchain");
+            return false;
+        }
+        if (!upscaled || g_dlss.backend != Backend::MetalFx || g_mfx.lastFrame != frame) {
+            g_fg.havePrev = false;  // menus, loading screens, upscaler off: start again afterwards
+            FgSkip(frame, "the MetalFX upscaler didn't run this frame");
+            return false;
+        }
+        if (g_dlss.outW != g_fg.extent.width || g_dlss.outH != g_fg.extent.height) {
+            FgSkip(frame, "the upscaler's output isn't the size of the screen");
+            return false;
+        }
+        if (!FgEnsure(d, queue) || !FgEnsureImages(d, g_dlss.inW, g_dlss.inH)) {
+            FgSkip(frame, g_fg.why.c_str());
+            return false;
+        }
+        gameIndex = pInfo->pImageIndices[0];
+        if (gameIndex >= g_fg.swapImages.size()) {
+            FgSkip(frame, "unknown swapchain image");
+            return false;
+        }
+        slot = (uint32_t)(g_fg.counter++ % kFgSlots);
+        outImage = g_dlss.outImage;
+        depth = g_dlss.depth32Image;
+        motion = g_dlss.mvImage;
+        gameImage = g_fg.swapImages[gameIndex];
+        swapchain = g_fg.swapchain;
+        swapImages = g_fg.swapImages;
+        w = g_fg.w;
+        h = g_fg.h;
+        bool continuous = g_fg.havePrev && g_fg.prevFrame + 1 == frame;
+        dump = FgDumpAt(frame) && !g_fg.dumpFailed;
+        if (dump && !g_fg.dumpBuf[0]) {
+            for (int i = 0; i < 3 && !g_fg.dumpFailed; ++i)
+                if (!CreateBuffer(d, (VkDeviceSize)g_fg.w * g_fg.h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  &g_fg.dumpBuf[i], &g_fg.dumpPtr[i]))
+                    g_fg.dumpFailed = true;
+            dump = !g_fg.dumpFailed;
+        }
+        dumpPrev = dump && continuous;
+        job.color = MtlTexture(d, outImage);
+        job.prevColor = MtlTexture(d, continuous ? g_fg.prevImage : outImage);
+        job.depth = MtlTexture(d, depth);
+        job.motion = MtlTexture(d, motion);
+        job.ui = MtlTexture(d, g_fg.uiImage);
+        job.output = MtlTexture(d, g_fg.genImage);
+        job.jitterX = g_mfx.lastJx;
+        job.jitterY = g_mfx.lastJy;
+        job.mvScaleX = g_cfg.mvScaleX;
+        job.mvScaleY = g_cfg.mvScaleY;
+        double dt = continuous ? std::chrono::duration<double>(now - g_fg.prevTime).count() : 1.0 / 30.0;
+        job.deltaTime = (float)std::min(std::max(dt, 0.001), 0.25);
+        bool cam = g_frameCam.frame == frame;
+        job.nearPlane = cam ? g_frameCam.nearPlane : 4.f;
+        job.farPlane = cam ? g_frameCam.farPlane : 7200.f;
+        job.fovDegrees = cam && g_frameCam.fovYDegrees > 0.f ? g_frameCam.fovYDegrees : 60.f;
+        job.aspect = cam && g_frameCam.aspect > 0.f ? g_frameCam.aspect : (float)g_fg.extent.width / g_fg.extent.height;
+        job.reset = !continuous || g_mfx.lastReset;
+        job.depthReversed = false;  // GL-style depth: near 0, far 1
+        if (LogFrame(frame))
+            Log("[fg] frame %llu: slot %u, dt %.1f ms, near %.3g far %.3g fov %.1f aspect %.3f%s",
+                (unsigned long long)frame, slot, job.deltaTime * 1000.f, job.nearPlane, job.farPlane,
+                job.fovDegrees, job.aspect, job.reset ? ", history reset" : "");
+        return true;
+    };
+    bool go;
+    {
+        TLock lk(g_t);
+        go = prepare();
+    }
+    if (!go) return passThrough();
+    // The slot's last use: its command buffer (and the MetalFX work it waited for) must be done.
+    if (g_fg.fenceUsed[slot]) {
+        if (g_fg.waitForFences(d->device, 1, &g_fg.fence[slot], VK_TRUE, 2000000000ull) != VK_SUCCESS) {
+            {
+                TLock lk(g_t);
+                Log("[fg] frame %llu: an earlier generated frame didn't finish within 2 s; frame generation off",
+                    (unsigned long long)frame);
+                g_cfg.frameGen = 0;  // the slot would hang again on every round
+                g_fg.havePrev = false;
+            }
+            return passThrough();
+        }
+        g_fg.resetFences(d->device, 1, &g_fg.fence[slot]);
+        g_fg.fenceUsed[slot] = false;
+    }
+    mfx_fg_slot_wait((int)slot);
+    // The extra image. FIFO with 3 images: one on screen, the game's, and this one once the screen moves on.
+    uint32_t genIndex = 0;
+    VkResult ar = g_fg.acquireNextImage(d->device, swapchain, 500000000ull, g_fg.semAcquire[slot], VK_NULL_HANDLE,
+                                        &genIndex);
+    if ((ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) || genIndex >= swapImages.size()) {
+        {
+            TLock lk(g_t);
+            char why[96];
+            std::snprintf(why, sizeof why, "no second swapchain image (vkAcquireNextImageKHR: %d)", (int)ar);
+            FgSkip(frame, why);
+            g_fg.havePrev = false;
+        }
+        return passThrough();
+    }
+    VkImage genSwap = swapImages[genIndex];
+
+    VkCommandBuffer cb = g_fg.cb[slot];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d->BeginCommandBuffer(cb, &bi);
+    // the finished frame (UI included) -> ours
+    FgBarrier(d, cb, gameImage, PRESENT, SRC, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    FgBarrier(d, cb, g_fg.uiImage, VK_IMAGE_LAYOUT_UNDEFINED, DST, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    FgCopy(d, cb, gameImage, g_fg.uiImage, w, h);
+    FgBarrier(d, cb, gameImage, SRC, PRESENT, VK_ACCESS_TRANSFER_READ_BIT, 0);
+    FgBarrier(d, cb, g_fg.uiImage, DST, RO, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (!g_fg.genInGeneral) {
+        FgBarrier(d, cb, g_fg.genImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                  VK_ACCESS_MEMORY_WRITE_BIT);
+        g_fg.genInGeneral = true;
+    }
+    // MetalFX: wait for "in", interpolate, signal "out"
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
+    g_mfx.cmdSetEvent(cb, g_fg.evIn[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    g_mfx.cmdWaitEvents(cb, 1, &g_fg.evOut[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        1, &mb, 0, nullptr, 0, nullptr);
+    // the generated frame -> the extra swapchain image
+    FgBarrier(d, cb, g_fg.genImage, VK_IMAGE_LAYOUT_GENERAL, SRC, VK_ACCESS_MEMORY_WRITE_BIT,
+              VK_ACCESS_TRANSFER_READ_BIT);
+    if (dump) {
+        VkBufferImageCopy bc{};
+        bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        bc.imageExtent = {w, h, 1};
+        if (dumpPrev) {
+            FgBarrier(d, cb, g_fg.prevImage, RO, SRC, 0, VK_ACCESS_TRANSFER_READ_BIT);
+            d->CmdCopyImageToBuffer(cb, g_fg.prevImage, SRC, g_fg.dumpBuf[0], 1, &bc);
+            FgBarrier(d, cb, g_fg.prevImage, SRC, RO, VK_ACCESS_TRANSFER_READ_BIT, 0);
+        }
+        d->CmdCopyImageToBuffer(cb, g_fg.genImage, SRC, g_fg.dumpBuf[1], 1, &bc);
+        FgBarrier(d, cb, g_fg.uiImage, RO, SRC, 0, VK_ACCESS_TRANSFER_READ_BIT);
+        d->CmdCopyImageToBuffer(cb, g_fg.uiImage, SRC, g_fg.dumpBuf[2], 1, &bc);
+        FgBarrier(d, cb, g_fg.uiImage, SRC, RO, VK_ACCESS_TRANSFER_READ_BIT, 0);
+    }
+    FgBarrier(d, cb, genSwap, VK_IMAGE_LAYOUT_UNDEFINED, DST, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    FgCopy(d, cb, g_fg.genImage, genSwap, w, h);
+    FgBarrier(d, cb, genSwap, DST, PRESENT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    FgBarrier(d, cb, g_fg.genImage, SRC, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_ACCESS_MEMORY_WRITE_BIT);
+    // this frame's upscaled image becomes the next interpolation's previous frame
+    FgBarrier(d, cb, outImage, RO, SRC, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    FgBarrier(d, cb, g_fg.prevImage, VK_IMAGE_LAYOUT_UNDEFINED, DST, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    FgCopy(d, cb, outImage, g_fg.prevImage, w, h);
+    FgBarrier(d, cb, outImage, SRC, RO, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT);
+    FgBarrier(d, cb, g_fg.prevImage, DST, RO, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    g_fg.endCommandBuffer(cb);
+
+    // Events "not set" before the submission (MoltenVK encodes set/wait with value + 1 at submit).
+    uint64_t vin = mfx_event_unset(g_fg.mtlIn[slot]), vout = mfx_event_unset(g_fg.mtlOut[slot]);
+    job.eventIn = g_fg.mtlIn[slot];
+    job.waitValue = vin + 1;
+    job.eventOut = g_fg.mtlOut[slot];
+    job.signalValue = vout + 1;
+    std::vector<VkSemaphore> waits(pInfo->pWaitSemaphores, pInfo->pWaitSemaphores + pInfo->waitSemaphoreCount);
+    waits.push_back(g_fg.semAcquire[slot]);
+    std::vector<VkPipelineStageFlags> stages(waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkSemaphore signals[2] = {g_fg.semGen[slot], g_fg.semGame[slot]};
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = (uint32_t)waits.size();
+    si.pWaitSemaphores = waits.data();
+    si.pWaitDstStageMask = stages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = 2;
+    si.pSignalSemaphores = signals;
+    VkResult sr = d->QueueSubmit(queue, 1, &si, g_fg.fence[slot]);
+    if (sr != VK_SUCCESS) {
+        // Nothing was submitted: the game's semaphores weren't waited on, so its present still works. The extra
+        // image stays acquired (swapchains have no way to give it back): present it as it is.
+        mfx_event_set(job.eventOut, job.signalValue);
+        {
+            TLock lk(g_t);
+            if (g_fg.errors++ < 5) Log("[fg] vkQueueSubmit failed (%d); frame generation off", (int)sr);
+            g_cfg.frameGen = 0;
+            g_fg.havePrev = false;
+        }
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &g_fg.semAcquire[slot];
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain;
+        pi.pImageIndices = &genIndex;
+        d->QueuePresentKHR(queue, &pi);
+        return passThrough();
+    }
+    g_fg.fenceUsed[slot] = true;
+    char err[256] = {};
+    bool encoded = mfx_fg_encode((int)slot, &job, err, sizeof err);
+    if (dump && g_fg.waitForFences(d->device, 1, &g_fg.fence[slot], VK_TRUE, 2000000000ull) == VK_SUCCESS) {
+        std::error_code ec;
+        std::filesystem::path dir = CaptureDir();
+        std::filesystem::create_directories(dir, ec);
+        char base[64];
+        std::snprintf(base, sizeof base, "fg_f%llu", (unsigned long long)frame);
+        bool bgra = g_fg.swapFmt == VK_FORMAT_B8G8R8A8_UNORM;
+        if (dumpPrev) FgWritePpm(dir / (std::string(base) + "_prev.ppm"), g_fg.dumpPtr[0], w, h, false);
+        FgWritePpm(dir / (std::string(base) + "_gen.ppm"), g_fg.dumpPtr[1], w, h, bgra);
+        FgWritePpm(dir / (std::string(base) + "_cur.ppm"), g_fg.dumpPtr[2], w, h, bgra);
+        TLock lk(g_t);
+        Log("[fg] wrote %s_{%sgen,cur}.ppm (%ux%u)", base, dumpPrev ? "prev," : "", w, h);
+    }
+    {
+        TLock lk(g_t);
+        if (!encoded && g_fg.errors++ < 5) Log("[fg] frame %llu: %s", (unsigned long long)frame, err);
+        g_fg.havePrev = true;
+        g_fg.prevFrame = frame;
+        g_fg.prevTime = now;
+        ++g_fg.generated;
+        if (g_fg.generated == 1) Log("[fg] first generated frame (frame %llu)", (unsigned long long)frame);
+        g_fg.skipWhy.clear();
+    }
+    // generated frame first, then the game's
+    VkPresentInfoKHR pg{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pg.waitSemaphoreCount = 1;
+    pg.pWaitSemaphores = &g_fg.semGen[slot];
+    pg.swapchainCount = 1;
+    pg.pSwapchains = &swapchain;
+    pg.pImageIndices = &genIndex;
+    VkResult r1 = d->QueuePresentKHR(queue, &pg);
+    VkPresentInfoKHR pgame = *pInfo;
+    pgame.waitSemaphoreCount = 1;
+    pgame.pWaitSemaphores = &g_fg.semGame[slot];
+    VkResult r2 = d->QueuePresentKHR(queue, &pgame);
+    if (r1 != VK_SUCCESS && r1 != VK_SUBOPTIMAL_KHR) {
+        TLock lk(g_t);
+        if (g_fg.errors++ < 5) Log("[fg] presenting the generated frame failed (%d)", (int)r1);
+    }
+    return r2;
 }
 #endif  // __APPLE__
 
@@ -4922,6 +5538,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyDevice(VkDevice device, const VkAll
             d->DeviceWaitIdle(device);
             DestroyFsr(d);
 #ifdef __APPLE__
+            FgDestroy(d);
             MfxDestroy(d);
 #endif
             DestroyGpuPerf(d);
@@ -5649,16 +6266,116 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateRenderPass2KHR(VkDevice device, 
     return r;
 }
 
+static const char* PresentModeName(VkPresentModeKHR m) {
+    switch (m) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR: return "immediate";
+        case VK_PRESENT_MODE_MAILBOX_KHR: return "mailbox";
+        case VK_PRESENT_MODE_FIFO_KHR: return "fifo";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "fifo relaxed";
+        default: return "other";
+    }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pInfo,
                                                              const VkAllocationCallbacks* pAllocator,
                                                              VkSwapchainKHR* pSwapchain) {
-    VkResult r = GetDevice(Key(device))->CreateSwapchainKHR(device, pInfo, pAllocator, pSwapchain);
+    DeviceData* d = GetDevice(Key(device));
+    VkSwapchainCreateInfoKHR ci = *pInfo;
+    bool forFg = false;
+#ifdef __APPLE__
+    // Frame generation presents a second image per frame: it copies into swapchain images (transfer usage),
+    // needs a free image while the game holds one and one is on screen (3 images), and relies on FIFO to show
+    // the two at successive refreshes.
+    std::string fgWhy;
+    if (g_cfg.frameGen && d->instance) {
+        auto caps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)d->instance->GetInstanceProcAddr(
+            d->instance->instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+        VkSurfaceCapabilitiesKHR sc{};
+        const VkImageUsageFlags need = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!caps || caps(d->physicalDevice, pInfo->surface, &sc) != VK_SUCCESS) fgWhy = "no surface capabilities";
+        else if ((sc.supportedUsageFlags & need) != need) fgWhy = "swapchain images can't be copied";
+        else if (sc.maxImageCount && sc.maxImageCount < 3) fgWhy = "the swapchain can't have 3 images";
+        else if (pInfo->imageFormat != VK_FORMAT_B8G8R8A8_UNORM && pInfo->imageFormat != VK_FORMAT_R8G8B8A8_UNORM)
+            fgWhy = "unsupported swapchain format";
+        else {
+            ci.imageUsage |= need;
+            ci.minImageCount = std::max(ci.minImageCount, 3u);
+            ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            forFg = true;
+        }
+    }
+#endif
+    VkResult r = d->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
+    if (r != VK_SUCCESS && forFg) {  // try again as the game asked
+        Log("[fg] swapchain with frame generation settings failed (%d); creating it as the game asked", (int)r);
+        ci = *pInfo;
+        forFg = false;
+        r = d->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
+    }
     if (r == VK_SUCCESS) {
         TLock lk(g_t);
         g_swapExtent = pInfo->imageExtent;
-        Log("[swapchain] %ux%u format %d", pInfo->imageExtent.width, pInfo->imageExtent.height, (int)pInfo->imageFormat);
+        Log("[swapchain] %ux%u format %d, %u images asked (%u used), present mode %s%s%s, usage 0x%x",
+            pInfo->imageExtent.width, pInfo->imageExtent.height, (int)pInfo->imageFormat, pInfo->minImageCount,
+            ci.minImageCount, PresentModeName(pInfo->presentMode),
+            ci.presentMode != pInfo->presentMode ? " -> " : "",
+            ci.presentMode != pInfo->presentMode ? PresentModeName(ci.presentMode) : "", (unsigned)ci.imageUsage);
+#ifdef __APPLE__
+        if (g_fg.swapchain) {  // replaced: our generated frames may still use the old one's images
+            d->DeviceWaitIdle(device);
+            g_fg.swapchain = VK_NULL_HANDLE;
+            g_fg.swapImages.clear();
+            g_fg.havePrev = false;
+        }
+        if (forFg) {
+            auto getImages = (PFN_vkGetSwapchainImagesKHR)d->GetDeviceProcAddr(device, "vkGetSwapchainImagesKHR");
+            uint32_t n = 0;
+            if (getImages && getImages(device, *pSwapchain, &n, nullptr) == VK_SUCCESS && n) {
+                g_fg.swapImages.resize(n);
+                getImages(device, *pSwapchain, &n, g_fg.swapImages.data());
+                g_fg.swapchain = *pSwapchain;
+                g_fg.swapFmt = pInfo->imageFormat;
+                g_fg.extent = pInfo->imageExtent;
+                Log("[fg] swapchain set up for frame generation (%u images, FIFO)", n);
+            }
+        } else if (g_cfg.frameGen)
+            Log("[fg] swapchain not set up for frame generation: %s", fgWhy.empty() ? "creation failed" : fgWhy.c_str());
+#endif
     }
     return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL tf3_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                          const VkAllocationCallbacks* pAllocator) {
+    DeviceData* d = GetDevice(Key(device));
+#ifdef __APPLE__
+    {
+        TLock lk(g_t);
+        if (swapchain && swapchain == g_fg.swapchain) {
+            d->DeviceWaitIdle(device);  // our generated frames copy into its images
+            g_fg.swapchain = VK_NULL_HANDLE;
+            g_fg.swapImages.clear();
+            g_fg.havePrev = false;
+        }
+    }
+#endif
+    d->DestroySwapchainKHR(device, swapchain, pAllocator);
+}
+
+static VKAPI_ATTR void VKAPI_CALL tf3_GetDeviceQueue(VkDevice device, uint32_t family, uint32_t index, VkQueue* pQueue) {
+    GetDevice(Key(device))->GetDeviceQueue(device, family, index, pQueue);
+    if (pQueue && *pQueue) {
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_queueFamily[*pQueue] = family;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL tf3_GetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pInfo, VkQueue* pQueue) {
+    GetDevice(Key(device))->GetDeviceQueue2(device, pInfo, pQueue);
+    if (pInfo && pQueue && *pQueue) {
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_queueFamily[*pQueue] = pInfo->queueFamilyIndex;
+    }
 }
 
 // =============================================================================================
@@ -6381,6 +7098,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pInfo) {
+    uint64_t presentFrame = 0;
+    bool upscaledNow = false;
     {
         PerfScope ps(kPerfPresent);
         TLock lk(g_t);
@@ -6529,14 +7248,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
 #ifdef __APPLE__
         // macOS hotkeys (debug_keys=1, game in front): Ctrl+Shift+D upscaler on/off (compare with the game's
         // FSR 1), Ctrl+Shift+O info box, Ctrl+Shift+Up/Down sharpness +/- 0.1, Ctrl+Shift+S sharpening RCAS <->
-        // CAS, Ctrl+Shift+A motion-adaptive sharpening on/off. Like the cfg_live reload, they last until
-        // tf3_dlss.cfg is saved again.
+        // CAS, Ctrl+Shift+A motion-adaptive sharpening on/off, Ctrl+Shift+F frame generation on/off (when the
+        // game started with frame_gen=1), Ctrl+Shift+G write a generated frame and its neighbours to mvcap/ (90
+        // frames later). Like the cfg_live reload, they last until tf3_dlss.cfg is saved again.
         if (g_cfg.debugKeys && g_frame % 2 == 0) {
-            enum { kA = 0, kS = 1, kD = 2, kO = 31, kUp = 126, kDown = 125, kShiftL = 56, kShiftR = 60, kCtrlL = 59,
-                   kCtrlR = 62 };
+            enum { kA = 0, kS = 1, kD = 2, kF = 3, kG = 5, kO = 31, kUp = 126, kDown = 125, kShiftL = 56,
+                   kShiftR = 60, kCtrlL = 59, kCtrlR = 62 };
             bool ctrlShift = (mfx_key_down(kCtrlL) || mfx_key_down(kCtrlR)) &&
                              (mfx_key_down(kShiftL) || mfx_key_down(kShiftR)) && mfx_app_focused();
-            static bool dWas = false, oWas = false, upWas = false, downWas = false, sWas = false, aWas = false;
+            static bool dWas = false, oWas = false, upWas = false, downWas = false, sWas = false, aWas = false,
+                        fWas = false, gWas = false;
             static float motionWas = 0.4f;  // the motion_sharpness Ctrl+Shift+A turns back on
             auto edge = [&](int key, bool& was) {
                 bool down = ctrlShift && mfx_key_down(key);
@@ -6571,6 +7292,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                 } else g_cfg.motionSharpness = motionWas;
                 Log("[sharpen] Ctrl+Shift+A: motion-adaptive sharpening %+.1f (frame %llu)", g_cfg.motionSharpness,
                     (unsigned long long)g_frame);
+            }
+            if (edge(kF, fWas)) {
+                if (!g_fg.swapchain)
+                    Log("[fg] Ctrl+Shift+F: the swapchain wasn't set up for frame generation; set frame_gen=1 in "
+                        "tf3_dlss.cfg and restart the game");
+                else {
+                    g_cfg.frameGen = g_cfg.frameGen ? 0 : 1;
+                    Log("[fg] Ctrl+Shift+F: frame generation %s (frame %llu)", g_cfg.frameGen ? "ON" : "OFF",
+                        (unsigned long long)g_frame);
+                }
+            }
+            if (edge(kG, gWas) && g_cfg.frameGen) {  // time to start moving the camera first
+                g_fg.dumpKeyFrame = g_frame + 90;
+                Log("[fg] Ctrl+Shift+G: writing the frames around frame %llu's generated frame (in about 3 s)",
+                    (unsigned long long)g_fg.dumpKeyFrame);
             }
         }
 #endif
@@ -6619,8 +7355,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             if (g_dlss.backend == Backend::MetalFx && mfx_gpu_ms() > 0.f)
                 Log("[mfx] frame %llu: MetalFX GPU %.2f ms (median of the last frames), %ux%u -> %ux%u, %.1f fps",
                     (unsigned long long)g_frame, mfx_gpu_ms(), g_dlss.inW, g_dlss.inH, g_dlss.outW, g_dlss.outH, g_fps);
+            if (g_cfg.frameGen)
+                Log("[fg] frame %llu: %llu frames generated, %llu not (%s), interpolation GPU %.2f ms (median)",
+                    (unsigned long long)g_frame, (unsigned long long)g_fg.generated, (unsigned long long)g_fg.skipped,
+                    g_fg.skipWhy.empty() ? "-" : g_fg.skipWhy.c_str(), mfx_fg_gpu_ms());
 #endif
         }
+        presentFrame = g_frame;
+        upscaledNow = g_lastDlssFrame == g_frame && g_lastSwapFrame == g_frame;
         ++g_frame;
         UpdateHot();
     }
@@ -6628,7 +7370,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
         TLock lk(g_t);
         PerfPresent();  // perf=1: frame times, and the report every perf_seconds
     }
+#ifdef __APPLE__
+    return FgPresent(GetDevice(Key(queue)), queue, pInfo, presentFrame, upscaledNow);
+#else
+    (void)presentFrame;
+    (void)upscaledNow;
     return GetDevice(Key(queue))->QueuePresentKHR(queue, pInfo);
+#endif
 }
 
 // =============================================================================================

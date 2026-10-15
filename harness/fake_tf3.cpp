@@ -20,7 +20,7 @@
 // and reports its own CPU time per frame for recording, which the layer's hooks add to.
 //
 // Usage: fake_tf3 [--out DIR] [--frames N] [--width W --height H] [--scale S] [--tiles X Y]
-//                 [--threads N] [--window] [--validation] [--no-checks]
+//                 [--threads N] [--window] [--validation] [--no-checks] [--speed K]
 // The scripts (harness/run.sh, scripts/run_harness.ps1) enable the layer and set its variables.
 
 #ifdef _WIN32
@@ -88,6 +88,7 @@ struct Options {
     uint32_t threads = 4;                  // threads recording the scene (TF3 records on several)
     bool window = false, validation = false, checks = true;
     uint32_t msaa = 1;                     // --msaa N: scene + tonemap passes multisampled (TF3's MSAA option)
+    float speed = 1.f;                     // --speed K: camera pan and cube K times faster (frame generation tests)
 } g_opt;
 
 // Camera and cube positions per frame. Captures are made away from the changes of motion.
@@ -95,10 +96,10 @@ constexpr float kNear = 1.f, kFar = 5000.f, kFovY = 1.0471976f;  // 60 degrees
 constexpr float kWallZ = -20.f;    // the wall faces the camera at this depth
 constexpr float kCubeZ = -12.f;    // cube centre; its front face is at view depth 11
 constexpr float kPanSpeed = 0.05f, kCubeSpeed = 0.04f;
-float CamX(uint32_t f) { return kPanSpeed * (float)std::clamp<int>((int)f - 100, 0, 80); }   // pans right on 100..180
-float CamY(uint32_t f) { return kPanSpeed * (float)std::clamp<int>((int)f - 180, 0, 80); }   // pans up on 180..260
-float CubeX(uint32_t f) {  // slides back and forth between -5 and 5, turning at frames 250, 500, ...
-    float t = std::fmod(kCubeSpeed * (float)f, 20.f);
+float CamX(uint32_t f) { return g_opt.speed * kPanSpeed * (float)std::clamp<int>((int)f - 100, 0, 80); }  // right, 100..180
+float CamY(uint32_t f) { return g_opt.speed * kPanSpeed * (float)std::clamp<int>((int)f - 180, 0, 80); }  // up, 180..260
+float CubeX(uint32_t f) {  // slides back and forth between -5 and 5, turning at frames 250, 500, ... (at speed 1)
+    float t = std::fmod(g_opt.speed * kCubeSpeed * (float)f, 20.f);
     return t < 10.f ? -5.f + t : 15.f - t;
 }
 const char* kCaptureFrames = "60,140,220";  // still, panning right, panning up
@@ -855,6 +856,7 @@ int main(int argc, char** argv) {
         else if (a == "--window") g_opt.window = true;
         else if (a == "--validation") g_opt.validation = true;
         else if (a == "--msaa") g_opt.msaa = (uint32_t)std::max(1, std::atoi(next()));
+        else if (a == "--speed") g_opt.speed = std::max(0.f, (float)std::atof(next()));
         else if (a == "--no-checks") g_opt.checks = false;
         else Die("unknown option %s (see the top of fake_tf3.cpp)", a.c_str());
     }

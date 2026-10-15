@@ -64,6 +64,8 @@ Depois siga os passos 3 e 4 da seção anterior.
   | **Ctrl+Shift+↑ / ↓** | Nitidez +/- 0,1 |
   | **Ctrl+Shift+S** | Tipo de nitidez: RCAS (padrão) ou CAS (a da versão 0.1), para comparar |
   | **Ctrl+Shift+A** | Nitidez extra no que se move: liga/desliga |
+  | **Ctrl+Shift+F** | Geração de frames liga/desliga (se o jogo abriu com `frame_gen=1`) |
+  | **Ctrl+Shift+G** | Grava um frame gerado e os vizinhos em `mvcap/`, ~3 s depois (para relatar problemas) |
 
 - As configurações ficam em `~/.local/share/tf3-metalfx/tf3_dlss.cfg`. Cada linha está explicada no
   próprio arquivo, e as mudanças valem assim que o arquivo é salvo, mesmo com o jogo aberto.
@@ -74,6 +76,23 @@ Depois siga os passos 3 e 4 da seção anterior.
     0 desliga.
   - `overlay=1`: mostra a caixa de informação ao iniciar.
   - `mip_bias=auto`: deixa as texturas nítidas apesar da resolução menor (vale após reiniciar o jogo).
+  - `frame_gen=1` (experimental): geração de frames, explicada logo abaixo. Vale após reiniciar o jogo.
+
+### Geração de frames (experimental)
+
+Com `frame_gen=1`, o MetalFX cria um frame intermediário entre cada dois frames do jogo e o mostra
+entre eles, então o movimento fica duas vezes mais fluido. A interface do jogo não é interpolada:
+o MetalFX a separa da imagem e a coloca por cima do frame gerado.
+
+- Precisa do macOS 26 ou mais novo e do MetalFX como upscaler.
+- Liga o vsync. Cada frame do jogo vira dois na tela, então o jogo roda no máximo na metade da
+  taxa do monitor: num monitor de 60 Hz, 30 fps do jogo viram 60 na tela.
+- Custa cerca de 6-8 ms de GPU por frame num M4 a 2560x1440 (medido fora do jogo; a caixa de
+  informação mostra "FG x MS"). Se o jogo cair abaixo de 30 fps, a tela fica abaixo de 60 e o
+  movimento perde regularidade.
+- Acrescenta cerca de um frame de atraso entre o mouse e a tela.
+- A caixa de informação do mod faz parte da imagem que o MetalFX desloca, então ela treme quando
+  a câmera se move. A interface do próprio jogo fica parada.
 
 ### Desempenho medido (Apple M4, saída 2560x1440)
 
@@ -235,6 +254,7 @@ Elas podem ir num arquivo `launch.env` ao lado do `launch.sh` (uma `VAR=valor` p
 | `TF3_DLSS_CAPTURE=900,1800` + `TF3_DLSS_CAPTURE_REL=1` | Grava pares de frames (cor, depth, vetores) em `mvcap/`, contando a partir de quando o mapa aparece. Analise com `python3 tools/mvcap_check.py <pasta>`. |
 | `TF3_DLSS_TRACE=300,600` | Uma linha de log por frame com a câmera e os vetores esperados. |
 | `TF3_DLSS_TEST_UPSCALER=1` | Upscaler bilinear de teste. |
+| `TF3_FG_DUMP=900,901` | Com `frame_gen=1`: grava o frame anterior (sem UI), o gerado e o atual em `mvcap/fg_f*.ppm`. Conta a partir do mapa com `TF3_DLSS_CAPTURE_REL=1`. |
 | `TF3_DLSS_MS_DEPTH=0` | Força o caminho antigo de leitura do depth (só para comparar). |
 
 ### Bugs encontrados no caminho (e o que ensinam)

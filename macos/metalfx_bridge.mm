@@ -16,18 +16,25 @@ id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
 id<MTLFXTemporalScaler> g_scaler = nil;
 id<MTLCommandBuffer> g_slotCb[kSlots] = {};
+// frame generation: the interpolator is id<MTLFXFrameInterpolator> (macOS 26+; the build targets 13)
+constexpr int kFgSlots = 8;
+id g_fg = nil;
+id<MTLCommandBuffer> g_fgSlotCb[kFgSlots] = {};
 
 // GPU timings, written by the command buffers' completion handlers (Metal's threads). Medians, not means:
 // when the game keeps the GPU busy, the GPU interleaves its work with ours, and now and then a command buffer's
 // start-to-end time covers some of the game's work too (seen in game: 3.4 ms typical, single frames up to 85 ms).
-std::mutex g_timeLock;
-constexpr int kRecent = 63;            // odd: one middle value
-double g_recent[kRecent] = {};         // last command buffers, for the overlay
-int g_recentN = 0, g_recentPos = 0;
-std::vector<double> g_winTimes;        // since the last mfx_gpu_window call
-constexpr size_t kWinCap = 16384;      // the median then uses the first ones (the sum and maximum stay exact)
-double g_winSumMs = 0.0, g_winMaxMs = 0.0;
-uint32_t g_winCount = 0;
+constexpr int kRecent = 63;        // odd: one middle value
+constexpr size_t kWinCap = 16384;  // the window's median then uses the first ones (the sum and maximum stay exact)
+struct GpuTimes {
+    std::mutex lock;
+    double recent[kRecent] = {};   // last command buffers, for the overlay
+    int recentN = 0, recentPos = 0;
+    std::vector<double> win;       // since the last Window() call
+    double winSum = 0.0, winMax = 0.0;
+    uint32_t winCount = 0;
+};
+GpuTimes g_scalerTimes, g_fgTimes;
 
 void SetErr(char* err, int len, const char* msg) {
     if (err && len > 0) std::snprintf(err, (size_t)len, "%s", msg);
@@ -41,42 +48,67 @@ double Median(double* v, size_t n) {
     return m;
 }
 
-void AddGpuTime(double ms) {
-    std::lock_guard<std::mutex> lk(g_timeLock);
-    g_recent[g_recentPos] = ms;
-    g_recentPos = (g_recentPos + 1) % kRecent;
-    if (g_recentN < kRecent) ++g_recentN;
-    if (g_winTimes.size() < kWinCap) g_winTimes.push_back(ms);
-    g_winSumMs += ms;
-    if (ms > g_winMaxMs) g_winMaxMs = ms;
-    ++g_winCount;
+void AddGpuTime(GpuTimes& t, double ms) {
+    std::lock_guard<std::mutex> lk(t.lock);
+    t.recent[t.recentPos] = ms;
+    t.recentPos = (t.recentPos + 1) % kRecent;
+    if (t.recentN < kRecent) ++t.recentN;
+    if (t.win.size() < kWinCap) t.win.push_back(ms);
+    t.winSum += ms;
+    if (ms > t.winMax) t.winMax = ms;
+    ++t.winCount;
 }
-}  // namespace
 
-float mfx_gpu_ms(void) {
+void ResetRecent(GpuTimes& t) {
+    std::lock_guard<std::mutex> lk(t.lock);
+    t.recentN = t.recentPos = 0;
+}
+
+float RecentMedian(GpuTimes& t) {
     double v[kRecent];
     int n;
     {
-        std::lock_guard<std::mutex> lk(g_timeLock);
-        n = g_recentN;
-        std::copy(g_recent, g_recent + n, v);
+        std::lock_guard<std::mutex> lk(t.lock);
+        n = t.recentN;
+        std::copy(t.recent, t.recent + n, v);
     }
     return (float)Median(v, (size_t)n);
 }
 
-void mfx_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count) {
+void Window(GpuTimes& t, double* medianMs, double* sumMs, double* maxMs, uint32_t* count) {
     std::vector<double> times;
     {
-        std::lock_guard<std::mutex> lk(g_timeLock);
-        times.swap(g_winTimes);
-        if (sumMs) *sumMs = g_winSumMs;
-        if (maxMs) *maxMs = g_winMaxMs;
-        if (count) *count = g_winCount;
-        g_winSumMs = g_winMaxMs = 0.0;
-        g_winCount = 0;
-        g_winTimes.reserve(1024);
+        std::lock_guard<std::mutex> lk(t.lock);
+        times.swap(t.win);
+        if (sumMs) *sumMs = t.winSum;
+        if (maxMs) *maxMs = t.winMax;
+        if (count) *count = t.winCount;
+        t.winSum = t.winMax = 0.0;
+        t.winCount = 0;
+        t.win.reserve(1024);
     }
     if (medianMs) *medianMs = Median(times.data(), times.size());
+}
+
+// Times a committed-to-be command buffer into t (only if it completes without error).
+void TimeCommandBuffer(id<MTLCommandBuffer> cb, GpuTimes* t) {
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
+        if (done.status == MTLCommandBufferStatusCompleted && ms > 0.0 && ms < 1000.0) AddGpuTime(*t, ms);
+    }];
+}
+}  // namespace
+
+float mfx_gpu_ms(void) { return RecentMedian(g_scalerTimes); }
+
+void mfx_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count) {
+    Window(g_scalerTimes, medianMs, sumMs, maxMs, count);
+}
+
+float mfx_fg_gpu_ms(void) { return RecentMedian(g_fgTimes); }
+
+void mfx_fg_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count) {
+    Window(g_fgTimes, medianMs, sumMs, maxMs, count);
 }
 
 bool mfx_init(void* mtlDevice, char* err, int errLen) {
@@ -103,6 +135,11 @@ void mfx_shutdown(void) {
         if (g_slotCb[i]) [g_slotCb[i] waitUntilCompleted];
         g_slotCb[i] = nil;
     }
+    for (int i = 0; i < kFgSlots; ++i) {
+        if (g_fgSlotCb[i]) [g_fgSlotCb[i] waitUntilCompleted];
+        g_fgSlotCb[i] = nil;
+    }
+    g_fg = nil;
     g_scaler = nil;
     g_queue = nil;
     g_device = nil;
@@ -140,10 +177,7 @@ bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uin
     desc.outputHeight = outH;
     desc.autoExposureEnabled = NO;  // the input is already tone-mapped
     g_scaler = [desc newTemporalScalerWithDevice:g_device];
-    {
-        std::lock_guard<std::mutex> lk(g_timeLock);
-        g_recentN = g_recentPos = 0;  // new sizes: start the overlay's median again
-    }
+    ResetRecent(g_scalerTimes);  // new sizes: start the overlay's median again
     if (!g_scaler) {
         SetErr(err, errLen, "newTemporalScalerWithDevice returned nil (unsupported sizes or formats)");
         return false;
@@ -170,6 +204,117 @@ uint64_t mfx_event_unset(void* sharedEvent) {
 void mfx_event_set(void* sharedEvent, uint64_t value) {
     id<MTLSharedEvent> e = (__bridge id<MTLSharedEvent>)sharedEvent;
     if (e && e.signaledValue < value) e.signaledValue = value;
+}
+
+bool mfx_fg_supported(void) {
+    if (!g_device) return false;
+    if (@available(macOS 26.0, *)) return [MTLFXFrameInterpolatorDescriptor supportsDevice:g_device];
+    return false;
+}
+
+bool mfx_fg_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t swapVkFormat, char* err,
+                      int errLen) {
+    if (!mfx_fg_supported()) {
+        SetErr(err, errLen, "MetalFX frame interpolation needs macOS 26 and a GPU that supports it");
+        return false;
+    }
+    MTLPixelFormat swapFmt;
+    switch (swapVkFormat) {
+        case 44: swapFmt = MTLPixelFormatBGRA8Unorm; break;  // VK_FORMAT_B8G8R8A8_UNORM
+        case 37: swapFmt = MTLPixelFormatRGBA8Unorm; break;  // VK_FORMAT_R8G8B8A8_UNORM
+        default:
+            if (err && errLen > 0)
+                std::snprintf(err, (size_t)errLen, "swapchain format VkFormat %u not supported", swapVkFormat);
+            return false;
+    }
+    for (int i = 0; i < kFgSlots; ++i)
+        if (g_fgSlotCb[i]) [g_fgSlotCb[i] waitUntilCompleted];
+    g_fg = nil;
+    ResetRecent(g_fgTimes);
+    if (@available(macOS 26.0, *)) {
+        MTLFXFrameInterpolatorDescriptor* desc = [MTLFXFrameInterpolatorDescriptor new];
+        desc.colorTextureFormat = MTLPixelFormatRGBA8Unorm;  // the upscaler's output
+        desc.outputTextureFormat = swapFmt;
+        desc.uiTextureFormat = swapFmt;                      // a copy of the swapchain image
+        desc.depthTextureFormat = MTLPixelFormatR32Float;
+        desc.motionTextureFormat = MTLPixelFormatRG16Float;
+        desc.inputWidth = inW;
+        desc.inputHeight = inH;
+        desc.outputWidth = outW;
+        desc.outputHeight = outH;
+        g_fg = [desc newFrameInterpolatorWithDevice:g_device];
+    }
+    if (!g_fg) {
+        SetErr(err, errLen, "newFrameInterpolatorWithDevice returned nil (unsupported sizes or formats)");
+        return false;
+    }
+    return true;
+}
+
+void mfx_fg_slot_wait(int slot) {
+    if (slot < 0 || slot >= kFgSlots) return;
+    if (g_fgSlotCb[slot]) [g_fgSlotCb[slot] waitUntilCompleted];
+    g_fgSlotCb[slot] = nil;
+}
+
+bool mfx_fg_encode(int slot, const MfxFgFrame* f, char* err, int errLen) {
+    if (!g_queue || slot < 0 || slot >= kFgSlots || !f) {
+        SetErr(err, errLen, "MetalFX not ready");
+        return false;
+    }
+    id<MTLSharedEvent> evIn = (__bridge id<MTLSharedEvent>)f->eventIn;
+    id<MTLSharedEvent> evOut = (__bridge id<MTLSharedEvent>)f->eventOut;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb || !evIn || !evOut) {
+        SetErr(err, errLen, "no command buffer or events");
+        return false;
+    }
+    cb.label = @"TF3 MetalFX frame interpolation";
+    [cb encodeWaitForEvent:evIn value:f->waitValue];
+    id<MTLTexture> color = (__bridge id<MTLTexture>)f->color, prev = (__bridge id<MTLTexture>)f->prevColor,
+                   depth = (__bridge id<MTLTexture>)f->depth, motion = (__bridge id<MTLTexture>)f->motion,
+                   ui = (__bridge id<MTLTexture>)f->ui, output = (__bridge id<MTLTexture>)f->output;
+    bool ok = false;
+    if (@available(macOS 26.0, *)) {
+        id<MTLFXFrameInterpolator> fi = (id<MTLFXFrameInterpolator>)g_fg;
+        if (fi && color && prev && depth && motion && ui && output) {
+            fi.colorTexture = color;
+            fi.prevColorTexture = prev;
+            fi.depthTexture = depth;
+            fi.motionTexture = motion;
+            fi.uiTexture = ui;
+            fi.uiTextureComposited = YES;  // ui = the finished frame; MetalFX takes the UI out of it
+            fi.outputTexture = output;
+            fi.motionVectorScaleX = f->mvScaleX;
+            fi.motionVectorScaleY = f->mvScaleY;
+            fi.jitterOffsetX = f->jitterX;
+            fi.jitterOffsetY = f->jitterY;
+            fi.deltaTime = f->deltaTime;
+            fi.nearPlane = f->nearPlane;
+            fi.farPlane = f->farPlane;
+            fi.fieldOfView = f->fovDegrees;
+            fi.aspectRatio = f->aspect;
+            fi.shouldResetHistory = f->reset;
+            fi.depthReversed = f->depthReversed;
+            [fi encodeToCommandBuffer:cb];
+            ok = true;
+        }
+    }
+    if (!ok) {
+        SetErr(err, errLen, "frame interpolator or textures missing; showing this frame twice");
+        if (ui && output && ui.pixelFormat == output.pixelFormat && ui.width == output.width &&
+            ui.height == output.height) {
+            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+            [be copyFromTexture:ui toTexture:output];
+            [be endEncoding];
+        }
+    }
+    // Always signal, or the game's GPU work would wait forever.
+    [cb encodeSignalEvent:evOut value:f->signalValue];
+    if (ok) TimeCommandBuffer(cb, &g_fgTimes);
+    [cb commit];
+    g_fgSlotCb[slot] = cb;
+    return ok;
 }
 
 bool mfx_key_down(int macKeyCode) {
@@ -224,11 +369,7 @@ bool mfx_encode(int slot, const MfxFrame* f, char* err, int errLen) {
     }
     // Always signal, or the game's GPU work would wait forever.
     [cb encodeSignalEvent:evOut value:f->signalValue];
-    if (ok)
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
-            if (done.status == MTLCommandBufferStatusCompleted && ms > 0.0 && ms < 1000.0) AddGpuTime(ms);
-        }];
+    if (ok) TimeCommandBuffer(cb, &g_scalerTimes);
     [cb commit];
     g_slotCb[slot] = cb;
     return ok;

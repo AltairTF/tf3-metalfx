@@ -68,6 +68,8 @@ MIT source (AMD FidelityFX, Dear ImGui).
 3. Frame generation with MTLFXFrameInterpolator (macOS 26+, supported on the M4). TF3 draws its UI after
    the blit, so the MetalFX output is a free UI-less image, which is what OptiScaler's HUDfix has to search
    for. Phases: harness prototype, in game with the UI interpolated, then a separate UI texture.
+   Prototype done (frame_gen=1, off by default), working in the harness; the in-game test is next. MetalFX
+   takes the UI out of the finished frame itself (uiTextureComposited), so no separate UI texture is needed.
 4. Reactive mask (MetalFX reactiveMaskTexture, macOS 14.4+) for smoke, particles, water and glass, only if
    ghosting on smoke shows up in game.
 5. Optional: an in-game menu (Dear ImGui), FSR 3.1 built from source on MoltenVK as a second backend.
@@ -240,3 +242,43 @@ MIT source (AMD FidelityFX, Dear ImGui).
   (2560x1440 RGBA8, about 30 MB of traffic per frame). With MetalFX, the scaler could write into the
   temporary image and the sharpening pass into the output, which drops the copy. Worth doing with the
   backend split before step 3, since frame generation also needs the output path reworked.
+
+## Roadmap step 3: frame generation (prototype 2026-10-15, verified in the harness)
+- Probe (scratchpad fgprobe.mm, M4, macOS 27): MTLFXFrameInterpolator is supported. Depth and motion can stay
+  at the render size while colour and output are at the output size. Motion vectors use the same convention
+  as the temporal scaler (render pixels, pointing to the previous position, scale 1): a square moving
+  80,40 px per frame came out exactly at the midpoint, and only when the frames are fed in order (fed the
+  same pair again and again, the output was the current frame). The UI test passed: a white bar composited
+  into the "ui" texture (uiTextureComposited) came out intact while the square moved.
+- Cost at 1280x720 -> 2560x1440, back-to-back command buffers: 7.7-9.8 ms GPU and about 3 ms CPU to encode
+  per generated frame; the temporal scaler measured the same way: 2.3 ms (3.4 ms in game). Attaching the
+  temporal scaler to the interpolator (descriptor.scaler) saved nothing. In the harness at 2048x1152 the
+  interpolation is 3.9 ms (median). So on a base M4 at 1440p, expect roughly 6-8 ms per generated frame.
+- Design (layer.cpp, "Frame generation"; metalfx_bridge.mm mfx_fg_*): with frame_gen=1 at swapchain creation
+  the swapchain gets transfer usage, 3 images and FIFO. At each present of a frame the MetalFX upscaler ran on,
+  the layer acquires a second swapchain image and submits one command buffer of its own on the game's queue
+  that waits for the present's semaphores, copies the finished frame (UI included) into uiImage, hands over
+  to MetalFX through a VkEvent pair exported as MTLSharedEvents (the same hand-off as the upscaler), copies the
+  generated frame into the second image and copies this frame's upscaled image into prevImage. It signals
+  two semaphores: one for presenting the generated image, one for the game's image, which are presented in
+  that order. MetalFX gets colour = the upscaled image (no UI), prevColor = the last one, depth (R32F),
+  motion (RG16F, render size), ui = the finished frame with uiTextureComposited, jitter, near / far,
+  vertical field of view and aspect from the projection matrix, and deltaTime from the present times. History
+  resets after a skipped frame, a camera cut or a size change. The game's next frame is submitted after the
+  hand-off on the same queue, so the shared inputs (depth, motion, the output image) can't be overwritten
+  while MetalFX reads them. The presents run outside the layer's lock, since FIFO can block them.
+- With FIFO the two images are shown at successive refreshes: the game runs at most at half the refresh rate
+  (30 -> 60 on the LG UltraFine 5K at 60 Hz, no VRR). MTLFXFrameInterpolator always makes the midpoint, so
+  other ratios would need presentation timing (VK_GOOGLE_display_timing), not done.
+- Harness (fake_tf3 --speed K multiplies the camera pan and the cube speed): all checks pass with
+  frame_gen=1, with and without MSAA 2x; Khronos validation shows only the 4 kinds of messages seen before.
+  tools fg_check.py / fg_cube.py on TF3_FG_DUMP frames: at 20 px per frame of pan the generated frame is
+  shifted by exactly 10 px (match error 0.16 vs 0.33 between the real frames, so it is not a blend); a cube
+  moving 30 px per frame is drawn halfway (edges 987 -> 1002 -> 1017); the UI panel is identical to the
+  current frame's. The cube's trailing edge smears over about 15 px where the wall is revealed (expected for
+  interpolation; small at normal speeds). Game frame time in the harness: 3.9 ms off, 9.7 ms on.
+- Known limits: the info box is drawn into the upscaled image, so MetalFX moves it with the scene (it shakes
+  in generated frames); the UI separation needs the game's blit to copy the upscaled image unchanged (true in
+  the harness, to be checked in game with Ctrl+Shift+G); frame_gen=1 needs a restart; macOS 26+.
+- In-game test to do: frame_gen=1 at 50%, Ctrl+Shift+F to compare, Ctrl+Shift+G while panning, perf=1 for
+  the "frame generation GPU" line.
