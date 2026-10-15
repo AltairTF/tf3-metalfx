@@ -4,7 +4,8 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-[ -f build-macos/bin/VkLayer_tf3_dlss.dylib ] || macos/build.sh
+# Always rebuild, so the zip never ships a stale layer.
+if [ -f build-macos/build.ninja ]; then cmake --build build-macos; else macos/build.sh; fi
 VER="$(grep -m1 'define TF3_DLSS_VERSION' layer/src/layer.cpp | sed "s/.*\"\(.*\)\".*/\1/")"
 OUT="dist-macos/TF3-MetalFX"
 rm -rf dist-macos && mkdir -p "$OUT/bin" "$OUT/licenses"
