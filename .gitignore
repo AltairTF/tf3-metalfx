@@ -20,3 +20,13 @@ game_shaders/
 .vscode/
 .idea/
 *.user
+
+# macOS port: build trees, local runs and downloaded headers
+build-macos/
+build-harness/
+dist-macos/
+mvcap/
+mvcap.*/
+launch.env
+third_party/nvsdk/
+.DS_Store

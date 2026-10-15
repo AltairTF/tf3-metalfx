@@ -45,6 +45,15 @@ foreach(SRC camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.
   list(APPEND SHADER_INCS "${OUT}")
 endforeach()
 
+# camera_mv.comp again with DEPTH_MS: the multisampled-depth variant (MSAA on)
+add_custom_command(
+  OUTPUT "${GEN_DIR}/camera_mv_ms.spv.inc"
+  COMMAND "${VULKAN_SDK}/Bin/glslangValidator.exe" --target-env vulkan1.1 -V -x -DDEPTH_MS
+          -o "${GEN_DIR}/camera_mv_ms.spv.inc" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/camera_mv.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/camera_mv.comp"
+  COMMENT "Compiling camera_mv.comp (DEPTH_MS)")
+list(APPEND SHADER_INCS "${GEN_DIR}/camera_mv_ms.spv.inc")
+
 add_library(VkLayer_tf3_dlss SHARED src/layer.cpp ${SHADER_INCS})
 target_include_directories(VkLayer_tf3_dlss PRIVATE "${VULKAN_SDK}/Include" "${DLSS_SDK}/include" "${GEN_DIR}"
                            "${FFX_DIR}/include")

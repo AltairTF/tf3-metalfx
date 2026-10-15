@@ -58,14 +58,31 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #ifdef _MSC_VER
 #include <intrin.h>  // __rdtsc (perf=1 timings)
-#else
+#define TF3_TICKS() __rdtsc()
+#elif defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#define TF3_TICKS() __rdtsc()
+#elif defined(__APPLE__)
+#include <mach/mach_time.h>  // Apple Silicon: no TSC; mach_absolute_time is a cheap monotonic counter
+#define TF3_TICKS() mach_absolute_time()
+#else
+#define TF3_TICKS() (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count()
+#endif
+
+#ifdef __APPLE__
+#include <vulkan/vulkan_metal.h>  // VK_EXT_metal_objects: MoltenVK's Metal objects for MetalFX
+#include "metalfx_bridge.h"
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -76,6 +93,12 @@
 #endif
 
 #define LAYER_NAME "VK_LAYER_TF3_dlss"
+
+#ifdef _WIN32
+#define TF3_SEP L"\\"
+#else
+#define TF3_SEP L"/"
+#endif
 
 namespace {
 
@@ -93,6 +116,13 @@ std::wstring ModuleDir() {
     std::wstring p(buf);
     size_t slash = p.find_last_of(L"\\/");
     return slash == std::wstring::npos ? L"." : p.substr(0, slash);
+#elif defined(__APPLE__)
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<const void*>(&ModuleDir), &info) || !info.dli_fname) return L".";
+    std::string p(info.dli_fname);
+    size_t slash = p.find_last_of('/');
+    p = slash == std::string::npos ? std::string(".") : p.substr(0, slash);
+    return std::wstring(p.begin(), p.end());
 #else
     return L".";
 #endif
@@ -158,6 +188,9 @@ bool IsGameProcess() {
         const wchar_t* name = std::wcsrchr(buf, L'\\');
         name = name ? name + 1 : buf;
         cached = _wcsicmp(name, L"TransportFever3.exe") == 0 ? 1 : 0;
+#elif defined(__APPLE__)
+        const char* name = getprogname();  // macOS: the game is a bare executable named TransportFever3
+        cached = name && std::strcmp(name, "TransportFever3") == 0 ? 1 : 0;
 #else
         cached = 1;
 #endif
@@ -178,8 +211,8 @@ void Log(const char* fmt, ...) {
         const char* env = std::getenv("TF3_DLSS_LOG");
         std::vector<std::wstring> paths;
         if (env && *env) paths.push_back(std::filesystem::path(env).wstring());
-        paths.push_back(RootDir() + L"\\tf3_dlss.log");
-        paths.push_back(TempDir() + L"\\tf3_dlss.log");  // mod folder not writable (e.g. Program Files)
+        paths.push_back(RootDir() + TF3_SEP L"tf3_dlss.log");
+        paths.push_back(TempDir() + TF3_SEP L"tf3_dlss.log");  // mod folder not writable (e.g. Program Files)
         for (const auto& p : paths)
             if ((g_log = OpenFile(p, L"w"))) {
                 g_logPath = p;
@@ -211,7 +244,7 @@ std::string g_statusReason;
 bool g_statusCleared = false;
 
 std::vector<std::wstring> StatusPaths() {
-    return {RootDir() + L"\\TF3-DLSS-DID-NOT-START.txt", TempDir() + L"\\TF3-DLSS-DID-NOT-START.txt"};
+    return {RootDir() + TF3_SEP L"TF3-DLSS-DID-NOT-START.txt", TempDir() + TF3_SEP L"TF3-DLSS-DID-NOT-START.txt"};
 }
 
 void WriteStatus(const std::string& reason) {
@@ -244,11 +277,12 @@ void ClearStatus() {
 // =============================================================================================
 // Config file (tf3_dlss.cfg)
 // =============================================================================================
-enum class UpscalerPref { Auto, Dlss, Fsr, Off };
+enum class UpscalerPref { Auto, Dlss, Fsr, MetalFx, Off };
 const char* PrefName(UpscalerPref p) {
     switch (p) {
         case UpscalerPref::Dlss: return "dlss";
         case UpscalerPref::Fsr: return "fsr";
+        case UpscalerPref::MetalFx: return "metalfx";
         case UpscalerPref::Off: return "off";
         default: return "auto";
     }
@@ -262,6 +296,8 @@ struct Config {
     int fsrDebug = 0;           // FSR: 1 = input checks (messages in the log), 2 = also FSR's debug view
     float fsrJitterSignX = 1.f; // FSR's jitter sign, like jitter_sign_x/y for DLSS
     float fsrJitterSignY = 1.f;
+    float mfxJitterSignX = 1.f;  // MetalFX's jitter sign (macOS). +1,+1 measured steadiest in the harness
+    float mfxJitterSignY = 1.f;  // (still camera: 0.1-0.2 vs 0.9-2.6 levels of frame-to-frame change for -1,-1)
     int debugKeys = 0;          // developer hotkeys (tests, draw log, motion/jitter toggles, debug view)
     int motionVectors = 1;      // 1 = camera motion vectors, 0 = zero motion (milestone 3 behaviour)
     float mvScaleX = 1.f;       // debug: multiply motion vectors (use -1 to flip an axis)
@@ -335,8 +371,9 @@ bool LoadConfig() {
             if (lv == "auto") c.upscaler = UpscalerPref::Auto;
             else if (lv == "dlss") c.upscaler = UpscalerPref::Dlss;
             else if (lv == "fsr" || lv == "fsr3") c.upscaler = UpscalerPref::Fsr;
+            else if (lv == "metalfx" || lv == "mfx") c.upscaler = UpscalerPref::MetalFx;
             else if (lv == "off" || lv == "0") c.upscaler = UpscalerPref::Off;
-            else Log("[cfg] upscaler=%s not understood (auto, dlss, fsr or off); using auto", v.c_str());
+            else Log("[cfg] upscaler=%s not understood (auto, dlss, fsr, metalfx or off); using auto", v.c_str());
         }
         else if (k == "fsr_color") {
             std::string lv = v;
@@ -373,6 +410,8 @@ bool LoadConfig() {
             c.mipBias = c.mipBiasAuto ? 0.f : fv;
         }
         else if (k == "jitter_sign_x") c.jitterSignX = fv;
+        else if (k == "mfx_jitter_sign_x") c.mfxJitterSignX = fv;
+        else if (k == "mfx_jitter_sign_y") c.mfxJitterSignY = fv;
         else if (k == "jitter_sign_y") c.jitterSignY = fv;
         else if (k == "dlss_dev") c.dlssDev = iv;
         else if (k == "debug_scale") c.debugScale = fv;
@@ -567,6 +606,7 @@ struct ImageInfo {
     uint32_t w = 0, h = 0;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     VkImageUsageFlags usage = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;  // MSAA render targets (TF3's MSAA setting)
 };
 
 struct DescItem {
@@ -678,6 +718,12 @@ struct CmdState {
     VkImage rcasOut = VK_NULL_HANDLE;
     bool rcasInThisPass = false;
     bool dlssDone = false;
+    // MetalFX (macOS): this command buffer signals/waits ring slot mfxSlot; the Metal work is committed at submit
+    bool mfxPending = false;
+    int mfxSlot = 0;
+    float mfxJx = 0, mfxJy = 0;
+    bool mfxReset = false;
+    uint32_t mfxInW = 0, mfxInH = 0;
     // motion vectors: the matrices for this frame are uploaded at submit into ring slot mvSlot
     bool mvPending = false;
     uint32_t mvSlot = 0;
@@ -769,13 +815,13 @@ struct PerfScope {
     explicit PerfScope(PerfCat c) : cat(c) {
         if (!g_cfg.perf) return;
         active = true;
-        if (t_perfDepth++ == 0) t0 = __rdtsc();
+        if (t_perfDepth++ == 0) t0 = TF3_TICKS();
     }
     ~PerfScope() {
         if (!active) return;
         --t_perfDepth;
         if (!t0) return;
-        g_perf.ticks[cat].fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        g_perf.ticks[cat].fetch_add(TF3_TICKS() - t0, std::memory_order_relaxed);
         g_perf.calls[cat].fetch_add(1, std::memory_order_relaxed);
     }
     PerfScope(const PerfScope&) = delete;
@@ -787,11 +833,11 @@ struct TLock {
     std::recursive_mutex& m;
     explicit TLock(std::recursive_mutex& mu) : m(mu) {
         if (m.try_lock()) return;
-        uint64_t t0 = g_cfg.perf ? __rdtsc() : 0;
+        uint64_t t0 = g_cfg.perf ? TF3_TICKS() : 0;
         m.lock();
         if (t0) {
             g_perf.lockWaits.fetch_add(1, std::memory_order_relaxed);
-            g_perf.lockWaitTicks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+            g_perf.lockWaitTicks.fetch_add(TF3_TICKS() - t0, std::memory_order_relaxed);
         }
     }
     ~TLock() { m.unlock(); }
@@ -943,8 +989,9 @@ std::string ImageDesc(VkImage img) {  // caller holds g_t
     if (it == g_images.end()) return H(img) + " (untracked)";
     char b[160];
     const char* fn = FormatName(it->second.fmt);
-    std::snprintf(b, sizeof b, "%s %ux%u %s%s usage=0x%x", H(img).c_str(), it->second.w, it->second.h,
-                  fn ? fn : "fmt#", fn ? "" : std::to_string((int)it->second.fmt).c_str(), (unsigned)it->second.usage);
+    std::snprintf(b, sizeof b, "%s %ux%u %s%s usage=0x%x%s", H(img).c_str(), it->second.w, it->second.h,
+                  fn ? fn : "fmt#", fn ? "" : std::to_string((int)it->second.fmt).c_str(), (unsigned)it->second.usage,
+                  it->second.samples > 1 ? (" samples=" + std::to_string((int)it->second.samples)).c_str() : "");
     return b;
 }
 VkImage ViewImage(VkImageView v) {
@@ -1067,9 +1114,10 @@ std::pair<int, int> FindSampled(const CmdState& cs, VkImage img) {
 // =============================================================================================
 // DLSS state
 // =============================================================================================
-enum class Backend { None, Dlss, Fsr, Test };
+enum class Backend { None, Dlss, Fsr, Test, MetalFx };
 const char* BackendName(Backend b) {
-    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : b == Backend::Test ? "test upscaler" : "none";
+    return b == Backend::Dlss ? "DLSS" : b == Backend::Fsr ? "FSR 3.1" : b == Backend::Test ? "test upscaler"
+         : b == Backend::MetalFx ? "MetalFX Temporal" : "none";
 }
 // TF3_DLSS_TEST_UPSCALER=1 (the test harness): a bilinear resize (test_upscale.comp) replaces DLSS and
 // FSR 3.1, so everything around the upscaler can be tested on any GPU. Not a cfg setting on purpose.
@@ -1116,6 +1164,8 @@ struct Dlss {
     VkDescriptorSetLayout mvSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout mvPipeLayout = VK_NULL_HANDLE;
     VkPipeline mvPipeline = VK_NULL_HANDLE;
+    VkPipeline mvPipelineMs = VK_NULL_HANDLE;  // for a multisampled game depth buffer
+    int mvDepthSamples = 0;                    // last logged sample count of the game's depth
     VkDescriptorPool mvPool = VK_NULL_HANDLE;
     VkDescriptorSet mvSet = VK_NULL_HANDLE;  // the one for the current depth view (from mvSets)
     // The game alternates between depth buffers (one per frame in flight), so keep a descriptor set
@@ -1288,6 +1338,12 @@ void Barrier(DeviceData* d, VkCommandBuffer cb, VkImage img, VkImageAspectFlags 
 const uint32_t kMvSpirv[] = {
 #include "camera_mv.spv.inc"
 };
+// The same shader built with DEPTH_MS: reads sample 0 of a multisampled depth buffer (TF3 with MSAA on).
+// Sampling a multisampled image through a plain sampler2D is invalid; NVIDIA tolerates it, but on
+// MoltenVK (macOS) it returns unrelated values, which made every motion vector wrong.
+const uint32_t kMvMsSpirv[] = {
+#include "camera_mv_ms.spv.inc"
+};
 // Per-frame camera data is written by the CPU at submit while the GPU may still be on earlier
 // frames, so the ring must be longer than the frames that can be queued. 16 is far more than any
 // swapchain allows (the old 4 relied on a GPU wait every frame that no longer exists).
@@ -1313,6 +1369,11 @@ struct CaptureFrame {
     MvUbo ubo{};
     float curPV[16] = {};  // unjittered projView of this frame
     float jx = 0, jy = 0;
+    // Copies of the readback buffers, taken right after the GPU finished, so the files can be written on
+    // another thread: writing them on the game's thread stalled it and made the next frame's camera jump.
+    std::vector<char> mv, mvFinal, depth, color, out;
+    uint32_t w = 0, h = 0, outW = 0, outH = 0;
+    int index = 0;
 };
 struct Capture {
     int requested = 0;  // frames still to capture
@@ -1330,8 +1391,17 @@ struct Capture {
 } g_cap;
 
 // TF3_DLSS_CAPTURE=90,190 (test harness): record two frames in a row after each of these frames,
-// as the Ctrl+Shift+T test does.
+// as the Ctrl+Shift+T test does. TF3_DLSS_CAPTURE_REL=1: the numbers count from the first frame with the
+// game's FSR pass (the map is on screen), not from the start of the process (menus take a varying time).
 bool CaptureRequestedAt(uint64_t frame) {
+    static const bool rel = [] {
+        const char* e = std::getenv("TF3_DLSS_CAPTURE_REL");
+        return e && *e == '1';
+    }();
+    if (rel) {
+        if (!g_firstFsrFrame || frame < g_firstFsrFrame) return false;
+        frame -= g_firstFsrFrame;
+    }
     static std::vector<uint64_t> frames = [] {
         std::vector<uint64_t> v;
         const char* e = std::getenv("TF3_DLSS_CAPTURE");
@@ -1632,20 +1702,27 @@ bool CreateMvResources(DeviceData* d, uint32_t w, uint32_t h) {
         pli.setLayoutCount = 1;
         pli.pSetLayouts = &g_dlss.mvSetLayout;
         if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_dlss.mvPipeLayout) != VK_SUCCESS) return false;
-        VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        si.codeSize = sizeof kMvSpirv;
-        si.pCode = kMvSpirv;
-        VkShaderModule mod;
-        if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
-        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = mod;
-        ci.stage.pName = "main";
-        ci.layout = g_dlss.mvPipeLayout;
-        VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_dlss.mvPipeline);
-        d->DestroyShaderModule(d->device, mod, nullptr);
-        if (r != VK_SUCCESS) return false;
+        auto makePipeline = [&](const uint32_t* code, size_t size, VkPipeline* out) {
+            VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            si.codeSize = size;
+            si.pCode = code;
+            VkShaderModule mod;
+            if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = mod;
+            ci.stage.pName = "main";
+            ci.layout = g_dlss.mvPipeLayout;
+            VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, out);
+            d->DestroyShaderModule(d->device, mod, nullptr);
+            return r == VK_SUCCESS;
+        };
+        if (!makePipeline(kMvSpirv, sizeof kMvSpirv, &g_dlss.mvPipeline)) return false;
+        if (!makePipeline(kMvMsSpirv, sizeof kMvMsSpirv, &g_dlss.mvPipelineMs)) {
+            g_dlss.mvPipelineMs = VK_NULL_HANDLE;
+            Log("[mv] could not create the multisampled-depth variant; MSAA depth will give zero motion");
+        }
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8},
                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8},
@@ -1977,6 +2054,40 @@ const char* ViewData(const CmdState& cs) {
     return mi->second.ptr + (at - mi->second.offset);
 }
 
+// TF3_DLSS_TRACE=start,count: [trace] lines for frames start..start+count-1 (the Ctrl+Shift+T trace,
+// for platforms without the hotkeys). Also logs the camera position again at present ([trace-present]),
+// to see whether the game changes the camera data after submitting the frame.
+bool g_envTraceInit = false;
+void EnvTraceUpdate() {
+    static uint64_t start = 0, count = 0;
+    if (!g_envTraceInit) {
+        g_envTraceInit = true;
+        if (const char* e = std::getenv("TF3_DLSS_TRACE")) {
+            char* end = nullptr;
+            start = std::strtoull(e, &end, 10);
+            count = (end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 240;
+        }
+    }
+    static const bool rel = [] {
+        const char* e = std::getenv("TF3_DLSS_CAPTURE_REL");
+        return e && *e == '1';
+    }();
+    if (count && g_firstFsrFrame && rel && g_frame == g_firstFsrFrame + start) {
+        g_traceUntil = g_frame + count;
+        Log("[trace] TF3_DLSS_TRACE: tracing frames %llu..%llu (relative to the first FSR frame)",
+            (unsigned long long)g_frame, (unsigned long long)(g_frame + count - 1));
+    } else if (count && !rel && g_frame == start) {
+        g_traceUntil = start + count;
+        Log("[trace] TF3_DLSS_TRACE: tracing frames %llu..%llu", (unsigned long long)start,
+            (unsigned long long)(start + count - 1));
+    }
+}
+struct TraceCam { uint64_t frame; VkBuffer buf; VkDeviceSize off; float cam[3]; };
+TraceCam g_traceHist[8] = {};  // camera buffers of the last frames, to see whether the game rewrites them
+VkBuffer g_traceViewBuf = VK_NULL_HANDLE;
+VkDeviceSize g_traceViewOff = 0;
+float g_traceCamAtSubmit[3] = {};
+
 // Called at submit, after the game has written this frame's camera data. Caller holds g_t.
 void UploadMvMatrices(const CmdState& cs) {
     MvUbo u{};
@@ -2002,6 +2113,10 @@ void UploadMvMatrices(const CmdState& cs) {
         std::memcpy(pv, v + ViewOff::projView, 64);
         std::memcpy(u.curInvViewProj, v + ViewOff::projViewInverse, 64);
         std::memcpy(cam, v + ViewOff::camPos, 12);
+        g_traceViewBuf = cs.viewBuf;
+        g_traceViewOff = cs.viewOff;
+        std::memcpy(g_traceCamAtSubmit, cam, 12);
+        g_traceHist[g_frame % 8] = TraceCam{g_frame, cs.viewBuf, cs.viewOff, {cam[0], cam[1], cam[2]}};
         float jx = cs.jitterSet ? cs.jx : 0.f, jy = cs.jitterSet ? cs.jy : 0.f;
         if (jx != 0.f || jy != 0.f)  // depth was rendered jittered: reconstruct with the jittered inverse
             JitterInverse(u.curInvViewProj, 2.f * jx / (float)vw, -2.f * jy / (float)vh);
@@ -2123,10 +2238,13 @@ void RecordCaptureCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImag
     d->CmdCopyBuffer(cb, g_dlss.mvBuffer, g_cap.mv, 1, &bc);
     VkBufferImageCopy ic{};
     ic.imageExtent = {g_cap.w, g_cap.h, 1};
-    Barrier(d, cb, cs.depthImage, depthAspects, RO, SRC);
-    ic.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-    d->CmdCopyImageToBuffer(cb, cs.depthImage, SRC, g_cap.depth, 1, &ic);
-    Barrier(d, cb, cs.depthImage, depthAspects, SRC, RO);
+    // Depth as the motion-vector pass read it (its R32F copy): valid for a multisampled game depth too,
+    // which can't be copied to a buffer directly, and shows exactly what the layer saw.
+    (void)depthAspects;
+    Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, RO, SRC);
+    ic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    d->CmdCopyImageToBuffer(cb, g_dlss.depth32Image, SRC, g_cap.depth, 1, &ic);
+    Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, SRC, RO);
     Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, SRC);
     ic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     d->CmdCopyImageToBuffer(cb, cs.colorImage, SRC, g_cap.color, 1, &ic);
@@ -2145,7 +2263,23 @@ void RecordCaptureCopies(DeviceData* d, VkCommandBuffer cb, CmdState& cs, VkImag
     cs.capPhase = g_cap.phase;
 }
 
+// Snapshot the readback buffers into f (after the GPU finished). Caller holds g_t.
+void SnapshotCapture(CaptureFrame& f) {
+    size_t n = (size_t)g_cap.w * g_cap.h * 4;
+    f.w = g_cap.w;
+    f.h = g_cap.h;
+    f.outW = g_cap.outW;
+    f.outH = g_cap.outH;
+    f.index = g_cap.counter++;
+    f.mv.assign(g_cap.mvPtr, g_cap.mvPtr + n);
+    f.mvFinal.assign(g_cap.mvFinalPtr, g_cap.mvFinalPtr + n);
+    f.depth.assign(g_cap.depthPtr, g_cap.depthPtr + n);
+    f.color.assign(g_cap.colorPtr, g_cap.colorPtr + n);
+    if (g_cap.outPtr) f.out.assign(g_cap.outPtr, g_cap.outPtr + (size_t)g_cap.outW * g_cap.outH * 4);
+}
+
 // Write one recorded frame (half resolution, every other pixel) plus a JSON description.
+// Uses only f's own data (runs on a background thread).
 void WriteCapture(const CaptureFrame& f) {
     std::error_code ec;
     std::filesystem::path dir = CaptureDir();
@@ -2154,8 +2288,8 @@ void WriteCapture(const CaptureFrame& f) {
     for (char& c : tag)
         if (!std::isalnum((unsigned char)c)) c = '_';
     char base[160];
-    std::snprintf(base, sizeof base, "cap%03d_f%llu_%s", g_cap.counter++, (unsigned long long)f.frame, tag.c_str());
-    uint32_t w2 = g_cap.w / 2, h2 = g_cap.h / 2;
+    std::snprintf(base, sizeof base, "cap%03d_f%llu_%s", f.index, (unsigned long long)f.frame, tag.c_str());
+    uint32_t w2 = f.w / 2, h2 = f.h / 2;
     std::vector<uint32_t> tmp((size_t)w2 * h2);
     auto dump = [&](const char* src, const char* ext, uint32_t sw, uint32_t sh) {  // every other pixel
         uint32_t dw = sw / 2, dh = sh / 2;
@@ -2166,11 +2300,11 @@ void WriteCapture(const CaptureFrame& f) {
         std::ofstream o(dir / (std::string(base) + ext), std::ios::binary);
         o.write(reinterpret_cast<const char*>(t.data()), (std::streamsize)(t.size() * 4));
     };
-    dump(g_cap.mvPtr, ".mv.bin", g_cap.w, g_cap.h);              // camera motion: packed half2, render pixels
-    dump(g_cap.mvFinalPtr, ".mvfinal.bin", g_cap.w, g_cap.h);    // what DLSS gets (camera + objects)
-    dump(g_cap.depthPtr, ".depth.bin", g_cap.w, g_cap.h);        // D24 in the low 24 bits
-    dump(g_cap.colorPtr, ".color.bin", g_cap.w, g_cap.h);        // DLSS input colour, R11G11B10 float
-    if (g_cap.outPtr) dump(g_cap.outPtr, ".out.bin", g_cap.outW, g_cap.outH);  // DLSS output, RGBA8
+    dump(f.mv.data(), ".mv.bin", f.w, f.h);              // camera motion: packed half2, render pixels
+    dump(f.mvFinal.data(), ".mvfinal.bin", f.w, f.h);    // what DLSS gets (camera + objects)
+    dump(f.depth.data(), ".depth.bin", f.w, f.h);        // depth as the MV pass read it, R32 float
+    dump(f.color.data(), ".color.bin", f.w, f.h);        // DLSS input colour, R11G11B10 float
+    if (!f.out.empty()) dump(f.out.data(), ".out.bin", f.outW, f.outH);  // DLSS output, RGBA8
     std::ofstream j(dir / (std::string(base) + ".json"));
     auto arr = [&](const float* v, int n) {
         std::string out = "[";
@@ -2181,11 +2315,11 @@ void WriteCapture(const CaptureFrame& f) {
         }
         return out + "]";
     };
-    j << "{\n  \"frame\": " << f.frame << ",\n  \"phase\": \"" << f.phase << "\",\n  \"render_w\": " << g_cap.w
-      << ",\n  \"render_h\": " << g_cap.h << ",\n  \"file_w\": " << w2 << ",\n  \"file_h\": " << h2
-      << ",\n  \"file_step\": 2,\n  \"out_file_w\": " << g_cap.outW / 2 << ",\n  \"out_file_h\": " << g_cap.outH / 2
+    j << "{\n  \"frame\": " << f.frame << ",\n  \"phase\": \"" << f.phase << "\",\n  \"render_w\": " << f.w
+      << ",\n  \"render_h\": " << f.h << ",\n  \"file_w\": " << w2 << ",\n  \"file_h\": " << h2
+      << ",\n  \"file_step\": 2,\n  \"out_file_w\": " << f.outW / 2 << ",\n  \"out_file_h\": " << f.outH / 2
       << ",\n  \"jitter_px\": " << arr(f.ubo.jitterPx, 2)
-      << ",\n  \"mv_enabled\": " << f.ubo.sizeAndScale[2]
+      << ",\n  \"mv_enabled\": " << f.ubo.sizeAndScale[2] << ",\n  \"depth_is_r32f\": 1"
       << ",\n  \"cur_inv_view_proj_jittered\": " << arr(f.ubo.curInvViewProj, 16)
       << ",\n  \"cur_inv_is_reprojection\": " << (f.ubo.sizeAndScale[3] == 1.f ? "true" : "false")
       << ",\n  \"prev_view_proj\": " << arr(f.ubo.prevViewProj, 16) << ",\n  \"cur_view_proj\": " << arr(f.curPV, 16)
@@ -2200,7 +2334,8 @@ bool EnsureImages(DeviceData* d, uint32_t inW, uint32_t inH, uint32_t outW, uint
         if (g_dlss.outImage) Log("[upscale] output size changed to %ux%u", outW, outH);
         if (!CreateOwnImage(d, outW, outH, VK_FORMAT_R8G8B8A8_UNORM,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // copied out by recordings
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |  // copied out by recordings
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,  // MetalFX output needs render-target usage
                             &g_dlss.outImage, &g_dlss.outView)) {
             Log("[upscale] failed to create the %ux%u output image; upscaling stops", outW, outH);
             g_dlss.outImage = VK_NULL_HANDLE;
@@ -3176,13 +3311,13 @@ struct PerfWindow {
 double PerfScopeTicks() {
     std::atomic<uint64_t> a{0}, b{0};
     const int n = 4096;
-    uint64_t t0 = __rdtsc();
+    uint64_t t0 = TF3_TICKS();
     for (int i = 0; i < n; ++i) {
-        uint64_t t = __rdtsc();
-        a.fetch_add(__rdtsc() - t, std::memory_order_relaxed);
+        uint64_t t = TF3_TICKS();
+        a.fetch_add(TF3_TICKS() - t, std::memory_order_relaxed);
         b.fetch_add(1, std::memory_order_relaxed);
     }
-    return (double)(__rdtsc() - t0) / n;
+    return (double)(TF3_TICKS() - t0) / n;
 }
 
 void PerfReset() {
@@ -3205,7 +3340,7 @@ void PerfPresent() {
         return;
     }
     double now = NowMs();
-    uint64_t tsc = __rdtsc();
+    uint64_t tsc = TF3_TICKS();
     if (!g_pw.running) {
         PerfReset();
         g_pw = PerfWindow{};
@@ -3432,6 +3567,8 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
     char b[kOvLines][96];
     bool fsr = backend == Backend::Fsr;
     if (fsr) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  FSR 3.1");
+    else if (backend == Backend::MetalFx) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  METALFX TEMPORAL");
+    else if (backend == Backend::Test) std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  TEST UPSCALER");
     else if (g_cfg.preset > 0)
         std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET %c", 'A' + g_cfg.preset - 1);
     else std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET AUTO");
@@ -3561,6 +3698,247 @@ bool EnsureTestUpscale(DeviceData* d) {
 }
 
 // Input colour in SHADER_READ_ONLY_OPTIMAL, outImage in GENERAL. Caller holds g_t.
+#ifdef __APPLE__
+// ---------------------------------------------------------------------------------------------
+// MetalFX Temporal (macOS / MoltenVK)
+// ---------------------------------------------------------------------------------------------
+// The game's command buffer gets vkCmdSetEvent(in[slot]) once our inputs are written and
+// vkCmdWaitEvents(out[slot]) before anything reads the output. MoltenVK turns those into
+// encodeSignalEvent / encodeWaitForEvent on the events' MTLSharedEvents with value "current + 1",
+// computed on the CPU when it encodes the command buffer (at vkQueueSubmit). At submit we make both
+// values even (MoltenVK's "not set"), let the game's submission through, then commit our own Metal
+// command buffer: wait(in, v+1) -> MetalFX -> signal(out, v+1), on our own queue.
+constexpr int kMfxSlots = 16;  // must match metalfx_bridge.mm
+struct MetalFx {
+    bool tried = false, ready = false;
+    std::string why = "not set up";
+    PFN_vkExportMetalObjectsEXT exportObjects = nullptr;
+    PFN_vkCreateEvent createEvent = nullptr;
+    PFN_vkDestroyEvent destroyEvent = nullptr;
+    PFN_vkCmdSetEvent cmdSetEvent = nullptr;
+    PFN_vkCmdWaitEvents cmdWaitEvents = nullptr;
+    VkEvent evIn[kMfxSlots] = {}, evOut[kMfxSlots] = {};
+    void* mtlIn[kMfxSlots] = {};
+    void* mtlOut[kMfxSlots] = {};
+    uint32_t counter = 0;
+    // our copy of the colour input (the game's image may rotate; MetalFX gets a stable texture)
+    VkImage colorImage = VK_NULL_HANDLE;
+    VkImageView colorView = VK_NULL_HANDLE;
+    VkFormat colorFmt = VK_FORMAT_UNDEFINED;
+    VkImageLayout colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t cw = 0, ch = 0;
+    // scaler configuration
+    uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
+    VkFormat confFmt = VK_FORMAT_UNDEFINED;
+    bool deviceExtEnabled = false;  // VK_EXT_metal_objects was enabled at device creation
+    int encodeErrors = 0;
+} g_mfx;
+
+void* MtlTexture(DeviceData* d, VkImage img) {
+    VkExportMetalTextureInfoEXT ti{VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+    ti.image = img;
+    ti.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+    VkExportMetalObjectsInfoEXT oi{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+    oi.pNext = &ti;
+    g_mfx.exportObjects(d->device, &oi);
+    return (void*)ti.mtlTexture;
+}
+
+// Once per device. Caller holds g_t.
+bool MfxEnsure(DeviceData* d) {
+    if (g_mfx.ready) return true;
+    if (g_mfx.tried) return false;
+    g_mfx.tried = true;
+    if (!g_mfx.deviceExtEnabled) {
+        g_mfx.why = "the Vulkan driver has no VK_EXT_metal_objects (MoltenVK needed)";
+        return false;
+    }
+    // The event hand-off relies on MoltenVK encoding command buffers at vkQueueSubmit (its default).
+    // Prefilled command buffers are encoded while recording, with event values we can't line up.
+    if (const char* pf = std::getenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS")) {
+        if (*pf && *pf != '0') {
+            g_mfx.why = "MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS is set; MetalFX hand-off disabled";
+            return false;
+        }
+    }
+    auto gdpa = d->GetDeviceProcAddr;
+    g_mfx.exportObjects = (PFN_vkExportMetalObjectsEXT)gdpa(d->device, "vkExportMetalObjectsEXT");
+    g_mfx.createEvent = (PFN_vkCreateEvent)gdpa(d->device, "vkCreateEvent");
+    g_mfx.destroyEvent = (PFN_vkDestroyEvent)gdpa(d->device, "vkDestroyEvent");
+    g_mfx.cmdSetEvent = (PFN_vkCmdSetEvent)gdpa(d->device, "vkCmdSetEvent");
+    g_mfx.cmdWaitEvents = (PFN_vkCmdWaitEvents)gdpa(d->device, "vkCmdWaitEvents");
+    if (!g_mfx.exportObjects || !g_mfx.createEvent || !g_mfx.cmdSetEvent || !g_mfx.cmdWaitEvents) {
+        g_mfx.why = "vkExportMetalObjectsEXT / event functions not available";
+        return false;
+    }
+    VkExportMetalDeviceInfoEXT di{VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT};
+    VkExportMetalObjectsInfoEXT oi{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+    oi.pNext = &di;
+    g_mfx.exportObjects(d->device, &oi);
+    char err[256] = {};
+    if (!mfx_init((void*)di.mtlDevice, err, sizeof err)) {
+        g_mfx.why = err;
+        return false;
+    }
+    for (int i = 0; i < kMfxSlots; ++i) {
+        VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        if (g_mfx.createEvent(d->device, &ei, nullptr, &g_mfx.evIn[i]) != VK_SUCCESS ||
+            g_mfx.createEvent(d->device, &ei, nullptr, &g_mfx.evOut[i]) != VK_SUCCESS) {
+            g_mfx.why = "vkCreateEvent failed";
+            return false;
+        }
+        for (int k = 0; k < 2; ++k) {
+            VkExportMetalSharedEventInfoEXT se{VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT};
+            se.event = k ? g_mfx.evOut[i] : g_mfx.evIn[i];
+            VkExportMetalObjectsInfoEXT o{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
+            o.pNext = &se;
+            g_mfx.exportObjects(d->device, &o);
+            (k ? g_mfx.mtlOut : g_mfx.mtlIn)[i] = (void*)se.mtlSharedEvent;
+        }
+        if (!g_mfx.mtlIn[i] || !g_mfx.mtlOut[i]) {
+            g_mfx.why = "MoltenVK's VkEvents are not MTLSharedEvents on this GPU";
+            return false;
+        }
+    }
+    g_mfx.ready = true;
+    g_mfx.why = "ready";
+    Log("[mfx] MetalFX Temporal ready (own Metal queue, %d event slots)", kMfxSlots);
+    return true;
+}
+
+void MfxDestroy(DeviceData* d) {
+    if (!g_mfx.ready && !g_mfx.tried) return;
+    mfx_shutdown();
+    for (int i = 0; i < kMfxSlots; ++i) {
+        if (g_mfx.evIn[i] && g_mfx.destroyEvent) g_mfx.destroyEvent(d->device, g_mfx.evIn[i], nullptr);
+        if (g_mfx.evOut[i] && g_mfx.destroyEvent) g_mfx.destroyEvent(d->device, g_mfx.evOut[i], nullptr);
+    }
+    g_mfx = MetalFx{};
+}
+
+// Records the MetalFX hand-off into the game's command buffer. Inputs: cs.colorImage (copied), the
+// camera pass's R32F depth, the motion-vector image; output: g_dlss.outImage (GENERAL). Caller holds g_t.
+bool RecordMetalFx(DeviceData* d, VkCommandBuffer cb, CmdState& cs, const ImageInfo& ci) {
+    if (!MfxEnsure(d) || !g_dlss.mvReady || !g_dlss.depth32Image) return false;
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    // colour copy (same format; MetalFX reads B10G11R11 directly)
+    if (!g_mfx.colorImage || g_mfx.cw != ci.w || g_mfx.ch != ci.h || g_mfx.colorFmt != ci.fmt) {
+        if (g_mfx.colorImage) {
+            d->DeviceWaitIdle(d->device);
+            d->DestroyImageView(d->device, g_mfx.colorView, nullptr);
+            d->DestroyImage(d->device, g_mfx.colorImage, nullptr);
+        }
+        if (!CreateOwnImage(d, ci.w, ci.h, ci.fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            &g_mfx.colorImage, &g_mfx.colorView)) {
+            g_mfx.colorImage = VK_NULL_HANDLE;
+            Log("[mfx] could not create the colour copy");
+            return false;
+        }
+        g_mfx.cw = ci.w;
+        g_mfx.ch = ci.h;
+        g_mfx.colorFmt = ci.fmt;
+        g_mfx.colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    if (g_mfx.inW != ci.w || g_mfx.inH != ci.h || g_mfx.outW != g_dlss.outW || g_mfx.outH != g_dlss.outH ||
+        g_mfx.confFmt != ci.fmt) {
+        char err[256] = {};
+        if (!mfx_configure(ci.w, ci.h, g_dlss.outW, g_dlss.outH, (uint32_t)ci.fmt, err, sizeof err)) {
+            Log("[mfx] scaler setup failed: %s", err);
+            g_mfx.ready = false;
+            g_mfx.why = err;
+            return false;
+        }
+        g_mfx.inW = ci.w;
+        g_mfx.inH = ci.h;
+        g_mfx.outW = g_dlss.outW;
+        g_mfx.outH = g_dlss.outH;
+        g_mfx.confFmt = ci.fmt;
+        g_dlss.resetNext = true;
+        Log("[mfx] temporal scaler %ux%u -> %ux%u (colour %s)", ci.w, ci.h, g_dlss.outW, g_dlss.outH,
+            FormatName(ci.fmt) ? FormatName(ci.fmt) : "?");
+    }
+    // the game's colour (RO) -> our copy
+    Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Barrier(d, cb, g_mfx.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {ci.w, ci.h, 1};
+    d->CmdCopyImage(cb, cs.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_mfx.colorImage,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    Barrier(d, cb, g_mfx.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, RO);
+    Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, RO);
+
+    int slot = (int)(g_mfx.counter++ % kMfxSlots);
+    // everything written so far -> visible to MetalFX; MetalFX's output -> visible to what follows
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
+    g_mfx.cmdSetEvent(cb, g_mfx.evIn[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    g_mfx.cmdWaitEvents(cb, 1, &g_mfx.evOut[slot], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+    cs.mfxPending = true;
+    cs.mfxSlot = slot;
+    cs.mfxJx = cs.jitterSet ? cs.jx * g_cfg.mfxJitterSignX : 0.f;
+    cs.mfxJy = cs.jitterSet ? cs.jy * g_cfg.mfxJitterSignY : 0.f;
+    cs.mfxReset = g_dlss.resetNext;
+    cs.mfxInW = ci.w;
+    cs.mfxInH = ci.h;
+    return true;
+}
+
+struct MfxJob {
+    int slot;
+    uint64_t vin, vout;
+    MfxFrame frame;
+};
+
+// Before the game's submission (caller holds g_t): free the slot, make the events "not set" and fill
+// in the Metal objects for this frame.
+bool MfxPrepare(DeviceData* d, const CmdState& cs, MfxJob& job) {
+    if (!g_mfx.ready) return false;
+    job.slot = cs.mfxSlot;
+    mfx_slot_wait(job.slot);
+    job.vin = mfx_event_unset(g_mfx.mtlIn[job.slot]);
+    job.vout = mfx_event_unset(g_mfx.mtlOut[job.slot]);
+    MfxFrame& f = job.frame;
+    f = MfxFrame{};
+    f.color = MtlTexture(d, g_mfx.colorImage);
+    f.depth = MtlTexture(d, g_dlss.depth32Image);
+    f.motion = MtlTexture(d, g_dlss.mvImage);
+    f.output = MtlTexture(d, g_dlss.outImage);
+    f.eventIn = g_mfx.mtlIn[job.slot];
+    f.waitValue = job.vin + 1;
+    f.eventOut = g_mfx.mtlOut[job.slot];
+    f.signalValue = job.vout + 1;
+    f.jitterX = cs.mfxJx;
+    f.jitterY = cs.mfxJy;
+    f.mvScaleX = g_cfg.mvScaleX;
+    f.mvScaleY = g_cfg.mvScaleY;
+    f.reset = cs.mfxReset;
+    f.depthReversed = false;  // GL-style depth: near 0, far 1
+    f.inW = cs.mfxInW;
+    f.inH = cs.mfxInH;
+    return true;
+}
+
+// After the game's submission: commit the MetalFX work. If the submission failed, release the events so
+// nothing waits forever.
+void MfxCommit(MfxJob& job, bool submitted) {
+    if (!submitted) {
+        mfx_event_set(job.frame.eventOut, job.frame.signalValue);
+        return;
+    }
+    char err[256] = {};
+    if (!mfx_encode(job.slot, &job.frame, err, sizeof err)) {
+        if (g_mfx.encodeErrors++ < 5) Log("[mfx] encode failed: %s", err);
+        mfx_event_set(job.frame.eventOut, job.frame.signalValue);
+    }
+}
+#endif  // __APPLE__
+
 bool RecordTestUpscale(DeviceData* d, VkCommandBuffer cb, const CmdState& cs) {
     if (!EnsureTestUpscale(d)) return false;
     bool isNew = false;
@@ -3615,7 +3993,13 @@ std::string NoUpscalerReason() {
     if (p == UpscalerPref::Off) return "upscaler=off in tf3_dlss.cfg";
     if (p == UpscalerPref::Dlss) return "upscaler=dlss, but " + g_dlss.why;
     if (p == UpscalerPref::Fsr) return "upscaler=fsr, but " + g_fsr.why;
+#ifdef __APPLE__
+    if (p == UpscalerPref::MetalFx) return "upscaler=metalfx, but " + g_mfx.why;
+    return "MetalFX: " + g_mfx.why;
+#else
+    if (p == UpscalerPref::MetalFx) return "upscaler=metalfx, but MetalFX exists only on macOS";
     return "DLSS: " + g_dlss.why + "; FSR: " + g_fsr.why;
+#endif
 }
 
 // Picks the upscaler for this frame from the setting and what works. Caller holds g_t.
@@ -3625,10 +4009,20 @@ Backend ChooseBackend() {
     auto fsrOk = [] { return !g_fsr.failed && FsrLoad(); };
     Backend b = Backend::None;
     if (TestUpscaler()) p = p == UpscalerPref::Off ? p : UpscalerPref::Auto;
+#ifdef __APPLE__
+    // macOS: no DLSS, no AMD runtime; MetalFX is the upscaler (MfxEnsure runs on the first recorded frame)
+    auto mfxOk = [] { return g_mfx.ready || !g_mfx.tried; };
+#else
+    auto mfxOk = [] { return false; };
+#endif
     switch (p) {
-        case UpscalerPref::Auto: b = TestUpscaler() ? Backend::Test : dlssOk ? Backend::Dlss : fsrOk() ? Backend::Fsr : Backend::None; break;
+        case UpscalerPref::Auto:
+            b = TestUpscaler() ? Backend::Test : mfxOk() ? Backend::MetalFx : dlssOk ? Backend::Dlss
+              : fsrOk() ? Backend::Fsr : Backend::None;
+            break;
         case UpscalerPref::Dlss: b = dlssOk ? Backend::Dlss : Backend::None; break;
         case UpscalerPref::Fsr: b = fsrOk() ? Backend::Fsr : Backend::None; break;
+        case UpscalerPref::MetalFx: b = mfxOk() ? Backend::MetalFx : Backend::None; break;
         case UpscalerPref::Off: break;
     }
     if (b != g_dlss.backend) {
@@ -3724,7 +4118,19 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         }
         // the depth copy (old contents not needed) -> writable
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mvPipeline);
+        int samples = (int)di.samples;
+        if (samples != g_dlss.mvDepthSamples) {
+            g_dlss.mvDepthSamples = samples;
+            Log("[mv] game depth %s has %d sample(s)%s", ImageDesc(cs.depthImage).c_str(), samples,
+                samples > 1 ? ": reading sample 0 (multisampled variant)" : "");
+        }
+        static const bool msVariant = [] {  // TF3_DLSS_MS_DEPTH=0: old behaviour, for comparing in the harness
+            const char* e = std::getenv("TF3_DLSS_MS_DEPTH");
+            return !(e && *e == '0');
+        }();
+        VkPipeline mvPipe = samples > 1 && msVariant ? g_dlss.mvPipelineMs : g_dlss.mvPipeline;
+        if (!mvPipe) mvPipe = g_dlss.mvPipeline;
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe);
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dlss.mvPipeLayout, 0, 1, &g_dlss.mvSet, 1, &dyn);
         d->CmdDispatch(cb, (ci.w + 7) / 8, (ci.h + 7) / 8, 1);
         Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, RO);
@@ -3741,7 +4147,10 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {ci.w, ci.h, 1};
         d->CmdCopyBufferToImage(cb, g_dlss.mvBuffer, g_dlss.mvImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        if (g_cfg.motionVectors && RecordObjectPass(d, cb, cs, depthView, dyn))
+        // A multisampled game depth can't be read through a plain sampler2D (MoltenVK returns unrelated
+        // values): the object pass then compares against the camera pass's single-sample R32F copy.
+        VkImageView objDepth = (di.samples > 1 && g_dlss.depth32View) ? g_dlss.depth32View : depthView;
+        if (g_cfg.motionVectors && RecordObjectPass(d, cb, cs, objDepth, dyn))
             Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, RO);
         else
             Barrier(d, cb, g_dlss.mvImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, RO);
@@ -3808,6 +4217,11 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
         dlssResult = (unsigned)r;
     } else if (backend == Backend::Fsr) {
         ok = RecordFsr(cb, cs, ci);
+    } else if (backend == Backend::MetalFx) {
+#ifdef __APPLE__
+        ok = RecordMetalFx(d, cb, cs, ci);
+        if (!ok && verbose) Log("[mfx] frame %llu: not recorded (%s)", (unsigned long long)g_frame, g_mfx.why.c_str());
+#endif
     } else {
         ok = RecordTestUpscale(d, cb, cs);
     }
@@ -4094,7 +4508,7 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyInstance(VkInstance instance, const
 // =============================================================================================
 static void InitNgx(DeviceData* d) {
     std::wstring dir = ModuleDir();
-    std::wstring dllDir = g_cfg.dlssDev ? dir + L"\\dev" : dir;  // dev build has debug overlays/hotkeys
+    std::wstring dllDir = g_cfg.dlssDev ? dir + TF3_SEP L"dev" : dir;  // dev build has debug overlays/hotkeys
     const wchar_t* paths[] = {dllDir.c_str()};
     Log("[dlss] loading %s DLSS runtime", g_cfg.dlssDev ? "developer" : "release");
     NVSDK_NGX_FeatureCommonInfo info{};
@@ -4351,6 +4765,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
         ci.pNext = &bdaExt;
         Log("[device] bufferDeviceAddress feature switched on (for DLSS)");
     }
+#ifdef __APPLE__
+    // MetalFX needs MoltenVK's Metal objects (device, textures, shared events)
+    bool addedMetalObjects = false;
+    if (supported.count(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) &&
+        !std::any_of(exts.begin(), exts.end(), [](const char* e) { return !std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME); })) {
+        exts.push_back(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+        addedMetalObjects = true;
+        Log("[device] + %s (for MetalFX)", VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+    } else if (supported.count(VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) {
+        addedMetalObjects = true;  // the game enabled it itself
+    }
+#endif
     FeaturePatch fp;
     size_t extsBeforeFsr = exts.size();
     bool fsrFeatures = wantFsr && inst && AddFsrFeatures(inst, physicalDevice, ci, exts, supported, fp);
@@ -4394,6 +4820,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateDevice(VkPhysicalDevice physical
             else if (pref == UpscalerPref::Fsr || pref == UpscalerPref::Off) g_dlss.why = "not used (upscaler setting)";
             else if (!extrasOk || !inst) g_dlss.why = "the Vulkan extensions DLSS needs couldn't be enabled";
             else InitNgx(d);
+#ifdef __APPLE__
+            g_mfx.deviceExtEnabled = addedMetalObjects && extrasOk;
+#endif
             // FSR only on a device created with its features (see AddFsrFeatures)
             g_fsr.deviceReady = fsrFeatures && extrasOk;
             if (!wantFsr) g_fsr.why = "not set up: the game was started with upscaler=dlss or off";
@@ -4416,6 +4845,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyDevice(VkDevice device, const VkAll
         if (g_dlss.dev == d) {
             d->DeviceWaitIdle(device);
             DestroyFsr(d);
+#ifdef __APPLE__
+            MfxDestroy(d);
+#endif
             DestroyGpuPerf(d);
             if (g_dlss.handle) NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.handle);
             if (g_dlss.params) NVSDK_NGX_VULKAN_DestroyParameters(g_dlss.params);
@@ -5026,7 +5458,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateImage(VkDevice device, const VkI
         TLock lk(g_t);
         if (IsDepthFormat(info.format) && info.extent.width >= 1000 && info.extent.width != info.extent.height)
             g_sceneRenderW = info.extent.width;  // the game's render width (for the texture LOD bias)
-        g_images[*pImage] = ImageInfo{info.extent.width, info.extent.height, info.format, info.usage};
+        g_images[*pImage] = ImageInfo{info.extent.width, info.extent.height, info.format, info.usage, info.samples};
         g_layout[*pImage] = info.initialLayout;
         if (info.extent.width >= 1800 && info.arrayLayers == 1 && (info.usage & 0x30))  // render targets only
             Log("[image] %s%s", ImageDesc(*pImage).c_str(), addedSampled ? "  (+SAMPLED)" : "");
@@ -5834,7 +6266,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
                 }
     }
     DeviceData* d = GetDevice(Key(queue));
+#ifdef __APPLE__
+    std::vector<MfxJob> mfxJobs;
+    {
+        TLock lk(g_t);
+        for (uint32_t s = 0; s < submitCount; ++s)
+            for (uint32_t c = 0; c < pSubmits[s].commandBufferCount; ++c) {
+                auto it = g_cmd.find(pSubmits[s].pCommandBuffers[c]);
+                if (it == g_cmd.end() || !it->second.mfxPending) continue;
+                MfxJob job;
+                if (MfxPrepare(d, it->second, job)) mfxJobs.push_back(job);
+            }
+    }
+#endif
     VkResult r = d->QueueSubmit(queue, submitCount, pSubmits, fence);
+#ifdef __APPLE__
+    if (!mfxJobs.empty()) {
+        TLock lk(g_t);
+        for (auto& job : mfxJobs) MfxCommit(job, r == VK_SUCCESS);
+    }
+#endif
     std::vector<CaptureFrame> toWrite;
     {
         TLock lk(g_t);
@@ -5842,8 +6293,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueueSubmit(VkQueue queue, uint32_t su
     }
     if (!toWrite.empty() && r == VK_SUCCESS) {
         d->QueueWaitIdle(queue);  // recording frames only: wait so the copies are complete
-        TLock lk(g_t);
-        for (const auto& f : toWrite) WriteCapture(f);
+        {
+            TLock lk(g_t);
+            for (auto& f : toWrite) SnapshotCapture(f);
+        }
+        std::thread([frames = std::move(toWrite)] {
+            for (const auto& f : frames) WriteCapture(f);
+        }).detach();
     }
     return r;
 }
@@ -5852,6 +6308,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
     {
         PerfScope ps(kPerfPresent);
         TLock lk(g_t);
+        EnvTraceUpdate();
+        if (g_frame < g_traceUntil && g_traceViewBuf) {
+            if (const char* v = RefData(g_traceViewBuf, g_traceViewOff)) {
+                float cam[3];
+                std::memcpy(cam, v + ViewOff::camPos, 12);
+                float dx = cam[0] - g_traceCamAtSubmit[0], dy = cam[1] - g_traceCamAtSubmit[1],
+                      dz = cam[2] - g_traceCamAtSubmit[2];
+                Log("[trace-present] frame %llu cam=(%.2f,%.2f,%.2f) changed since submit by %.3f, buffer %s+%llu",
+                    (unsigned long long)g_frame, cam[0], cam[1], cam[2], std::sqrt(dx * dx + dy * dy + dz * dz),
+                    H(g_traceViewBuf).c_str(), (unsigned long long)g_traceViewOff);
+            }
+            // Older frames' camera buffers: did the game write new data into them since we read them?
+            char hist[256];
+            int len = 0;
+            for (uint64_t back = 1; back <= 6 && back <= g_frame; ++back) {
+                const TraceCam& h = g_traceHist[(g_frame - back) % 8];
+                if (h.frame != g_frame - back || !h.buf) continue;
+                const char* v = RefData(h.buf, h.off);
+                if (!v) continue;
+                float c[3];
+                std::memcpy(c, v + ViewOff::camPos, 12);
+                float dd = std::sqrt((c[0] - h.cam[0]) * (c[0] - h.cam[0]) + (c[1] - h.cam[1]) * (c[1] - h.cam[1]) +
+                                     (c[2] - h.cam[2]) * (c[2] - h.cam[2]));
+                len += std::snprintf(hist + len, sizeof hist - len, " -%llu:%.2f", (unsigned long long)back, dd);
+                if (len >= (int)sizeof hist - 32) break;
+            }
+            Log("[trace-reuse] frame %llu buffers of earlier frames changed by:%s", (unsigned long long)g_frame, hist);
+        }
 #ifdef _WIN32
         // Hotkeys, only while the game window has focus and only with debug_keys=1 in tf3_dlss.cfg (players
         // choose with the cfg, so a stray key press can't switch the upscaler off):
@@ -5964,6 +6448,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
             Log("[mv] Ctrl+Shift+M: motion vectors %s (frame %llu)",
                 !g_cfg.motionVectors ? "OFF" : g_cfg.objectMotion ? "camera + objects" : "camera only",
                 (unsigned long long)g_frame);
+        }
+#endif
+#ifdef __APPLE__
+        // macOS hotkeys (debug_keys=1, game in front): Ctrl+Shift+D upscaler on/off (compare with the game's
+        // FSR 1), Ctrl+Shift+O info box, Ctrl+Shift+Up/Down sharpness +/- 0.1.
+        if (g_cfg.debugKeys && g_frame % 2 == 0) {
+            enum { kD = 2, kO = 31, kUp = 126, kDown = 125, kShiftL = 56, kShiftR = 60, kCtrlL = 59, kCtrlR = 62 };
+            bool ctrlShift = (mfx_key_down(kCtrlL) || mfx_key_down(kCtrlR)) &&
+                             (mfx_key_down(kShiftL) || mfx_key_down(kShiftR)) && mfx_app_focused();
+            static bool dWas = false, oWas = false, upWas = false, downWas = false;
+            auto edge = [&](int key, bool& was) {
+                bool down = ctrlShift && mfx_key_down(key);
+                bool e = down && !was;
+                was = down;
+                return e;
+            };
+            if (edge(kD, dWas)) {
+                g_dlss.enabled = !g_dlss.enabled;
+                g_dlss.resetNext = true;
+                Log("[upscale] Ctrl+Shift+D: upscaler %s (frame %llu)", g_dlss.enabled ? "ON" : "OFF",
+                    (unsigned long long)g_frame);
+            }
+            if (edge(kO, oWas)) {
+                g_cfg.overlay = g_cfg.overlay ? 0 : 1;
+                Log("[overlay] Ctrl+Shift+O: info box %s", g_cfg.overlay ? "ON" : "OFF");
+            }
+            bool up = edge(kUp, upWas), dn = edge(kDown, downWas);
+            if (up || dn) {
+                g_cfg.sharpness = std::min(1.f, std::max(0.f, g_cfg.sharpness + (up ? 0.1f : -0.1f)));
+                Log("[sharpen] Ctrl+Shift+%s: sharpness %.1f", up ? "Up" : "Down", g_cfg.sharpness);
+            }
         }
 #endif
         if (CaptureRequestedAt(g_frame)) {
@@ -6091,6 +6606,17 @@ static void LogHeader() {
         if (auto fn = (RtlGetVersionFn)(void*)GetProcAddress(nt, "RtlGetVersion")) fn(&os);
     Log("Windows %lu.%lu build %lu", (unsigned long)os.dwMajorVersion, (unsigned long)os.dwMinorVersion,
         (unsigned long)os.dwBuildNumber);
+#elif defined(__APPLE__)
+    char exe[4096] = {};
+    uint32_t exeSize = sizeof exe;
+    if (_NSGetExecutablePath(exe, &exeSize) != 0) exe[0] = 0;
+    Log("game: %s", exe);
+    char osVer[64] = {}, model[64] = {};
+    size_t n = sizeof osVer;
+    sysctlbyname("kern.osproductversion", osVer, &n, nullptr, 0);
+    n = sizeof model;
+    sysctlbyname("hw.model", model, &n, nullptr, 0);
+    Log("macOS %s, %s", osVer, model);
 #endif
     Log("mod folder: %s", Narrow(RootDir()).c_str());
     Log("log: %s", Narrow(g_logPath).c_str());

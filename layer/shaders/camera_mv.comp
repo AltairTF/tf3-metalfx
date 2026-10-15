@@ -22,7 +22,11 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#ifdef DEPTH_MS
+layout(set = 0, binding = 0) uniform sampler2DMS depthTex;  // multisampled depth (MSAA on): sample 0
+#else
 layout(set = 0, binding = 0) uniform sampler2D depthTex;
+#endif
 // Packed half2 per pixel (row-major, tightly packed); copied into an R16G16_SFLOAT image after.
 // (A buffer avoids needing the shaderStorageImageExtendedFormats device feature.)
 layout(set = 0, binding = 1, std430) writeonly buffer MvOut { uint mvOut[]; };

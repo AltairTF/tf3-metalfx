@@ -6,6 +6,11 @@ Unofficial and experimental; not affiliated with Urban Games, NVIDIA or AMD.
 
 **[⬇ Download the latest release](https://github.com/lucasmokwa/tf3-dlss/releases/latest)**
 
+> **macOS (Apple Silicon):** this fork adds a macOS build that uses Apple's **MetalFX Temporal** through
+> MoltenVK, plus a fix for motion vectors with MSAA on. Install and usage (Portuguese):
+> [docs/TUTORIAL_MACOS.md](docs/TUTORIAL_MACOS.md). Technical log: [docs/MACOS_PORT.md](docs/MACOS_PORT.md).
+> Quick start from source: `macos/build.sh && macos/install.sh`, then put the printed launch option in Steam.
+
 ## Install
 
 You need Windows 10 or 11 and Transport Fever 3 on Steam. DLSS needs an NVIDIA RTX card (20 series or

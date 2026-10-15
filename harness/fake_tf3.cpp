@@ -87,6 +87,7 @@ struct Options {
     uint32_t tilesX = 64, tilesY = 24;     // the wall is drawn as tilesX * tilesY separate draws
     uint32_t threads = 4;                  // threads recording the scene (TF3 records on several)
     bool window = false, validation = false, checks = true;
+    uint32_t msaa = 1;                     // --msaa N: scene + tonemap passes multisampled (TF3's MSAA option)
 } g_opt;
 
 // Camera and cube positions per frame. Captures are made away from the changes of motion.
@@ -273,14 +274,15 @@ uint32_t MemType(uint32_t bits, VkMemoryPropertyFlags want) {
     Die("no memory type for %x", want);
 }
 
-Image MakeImage(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+Image MakeImage(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
     Image im;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = fmt;
     ci.extent = {w, h, 1};
     ci.mipLevels = ci.arrayLayers = 1;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.samples = samples;
     ci.usage = usage;
     VKC(vkCreateImage(g.dev, &ci, nullptr, &im.image));
     VkMemoryRequirements req;
@@ -359,6 +361,9 @@ void CreateInstanceAndSurface() {
     }
     bool debug = g_opt.validation && HasExt(exts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (debug) want.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // MoltenVK is a portability driver: the loader only lists it with this extension + flag.
+    bool portability = HasExt(exts, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    if (portability) want.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "fake_tf3";
@@ -367,6 +372,7 @@ void CreateInstanceAndSurface() {
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
+    if (portability) ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     VKC(vkCreateInstance(&ci, nullptr, &g.instance));
 
     if (debug) {
@@ -440,12 +446,19 @@ void CreateDevice() {
     qi.queueFamilyIndex = g.qfam;
     qi.queueCount = 1;
     qi.pQueuePriorities = &prio;
-    const char* exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    {   // portability drivers (MoltenVK) require VK_KHR_portability_subset to be enabled when offered
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(g.gpu, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> dexts(n);
+        vkEnumerateDeviceExtensionProperties(g.gpu, nullptr, &n, dexts.data());
+        if (HasExt(dexts, "VK_KHR_portability_subset")) exts.push_back("VK_KHR_portability_subset");
+    }
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qi;
-    ci.enabledExtensionCount = 1;
-    ci.ppEnabledExtensionNames = exts;
+    ci.enabledExtensionCount = (uint32_t)exts.size();
+    ci.ppEnabledExtensionNames = exts.data();
     VKC(vkCreateDevice(g.gpu, &ci, nullptr, &g.dev));
     vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
 
@@ -513,10 +526,16 @@ void CreateSwapchain() {
 // One colour attachment, optionally the depth buffer as well. Every pass is followed by reads of
 // what it wrote (sampling, the next pass's depth test, a readback copy).
 enum class Load { Clear, KeepDepth, KeepAll };  // what the pass starts from
-VkRenderPass MakeRenderPass(VkFormat color, VkImageLayout colorFinal, bool withDepth, Load load) {
-    VkAttachmentDescription att[2]{};
+// samples > 1: colour and depth are multisampled and the colour is resolved into a third attachment
+// (single-sample, colorFinal), as TF3 does with MSAA on.
+VkRenderPass MakeRenderPass(VkFormat color, VkImageLayout colorFinal, bool withDepth, Load load,
+                            VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
+    const bool ms = samples != VK_SAMPLE_COUNT_1_BIT;
+    const VkImageLayout resolveFinal = colorFinal;
+    if (ms) colorFinal = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;  // the MS image is only ever an attachment
+    VkAttachmentDescription att[3]{};
     att[0].format = color;
-    att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[0].samples = samples;
     att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -534,6 +553,12 @@ VkRenderPass MakeRenderPass(VkFormat color, VkImageLayout colorFinal, bool withD
     att[1].storeOp = att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[1].initialLayout = clearDepth ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    att[2] = att[0];  // resolve target
+    att[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[2].finalLayout = resolveFinal;
+    VkAttachmentReference rref{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sp{};
@@ -541,6 +566,7 @@ VkRenderPass MakeRenderPass(VkFormat color, VkImageLayout colorFinal, bool withD
     sp.colorAttachmentCount = 1;
     sp.pColorAttachments = &cref;
     sp.pDepthStencilAttachment = withDepth ? &dref : nullptr;
+    if (ms) sp.pResolveAttachments = &rref;
     const VkPipelineStageFlags kAll = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -561,7 +587,8 @@ VkRenderPass MakeRenderPass(VkFormat color, VkImageLayout colorFinal, bool withD
     dep[1].srcAccessMask = kWrites;
     dep[1].dstAccessMask = kWrites | kReads | VK_ACCESS_TRANSFER_READ_BIT;
     VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    ci.attachmentCount = withDepth ? 2 : 1;
+    if (ms && !withDepth) Die("multisampled passes have a depth buffer here");
+    ci.attachmentCount = ms ? 3 : withDepth ? 2 : 1;
     ci.pAttachments = att;
     ci.subpassCount = 1;
     ci.pSubpasses = &sp;
@@ -593,6 +620,7 @@ struct PipeDesc {
     VkPipelineLayout layout;
     VkRenderPass rp;
     bool scene = false;  // vertex input + depth test
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 VkPipeline MakePipeline(const PipeDesc& p) {
     VkShaderModule vs = Shader(p.vs, p.vsBytes), fs = Shader(p.fs, p.fsBytes);
@@ -620,7 +648,7 @@ VkPipeline MakePipeline(const PipeDesc& p) {
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.lineWidth = 1.f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = p.samples;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = ds.depthWriteEnable = p.scene;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
@@ -762,10 +790,11 @@ void CheckCapture(const fs::path& json, const Mat4& proj) {
     float camDx = CamX(frame) - CamX(frame - 1), camDy = CamY(frame) - CamY(frame - 1);
     float cubeDx = CubeX(frame) - CubeX(frame - 1);
     double sx = proj.m[0] * rw / 2.0, sy = proj.m[5] * rh / 2.0;
+    const bool depthR32f = JsonNumber(j, "depth_is_r32f") == 1.0;  // newer layers record their own R32F copy
     std::vector<float> z(dep.size());
     for (size_t i = 0; i < dep.size(); ++i) {
         float d;
-        if (g.depthFmt == VK_FORMAT_D24_UNORM_S8_UINT) d = (float)(dep[i] & 0xFFFFFF) / 16777215.f;
+        if (g.depthFmt == VK_FORMAT_D24_UNORM_S8_UINT && !depthR32f) d = (float)(dep[i] & 0xFFFFFF) / 16777215.f;
         else std::memcpy(&d, &dep[i], 4);
         float zn = d * 2.f - 1.f;
         z[i] = 2.f * kNear * kFar / (kFar + kNear - zn * (kFar - kNear));
@@ -825,6 +854,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") g_opt.threads = std::max(1, std::atoi(next()));
         else if (a == "--window") g_opt.window = true;
         else if (a == "--validation") g_opt.validation = true;
+        else if (a == "--msaa") g_opt.msaa = (uint32_t)std::max(1, std::atoi(next()));
         else if (a == "--no-checks") g_opt.checks = false;
         else Die("unknown option %s (see the top of fake_tf3.cpp)", a.c_str());
     }
@@ -847,20 +877,32 @@ int main(int argc, char** argv) {
     const VkImageUsageFlags kTarget = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     Image hdr = MakeImage(g.render.width, g.render.height, kHdr, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     Image ldr = MakeImage(g.render.width, g.render.height, kHdr, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
+    const VkSampleCountFlagBits kSamples = (VkSampleCountFlagBits)g_opt.msaa;
+    const bool msaa = g_opt.msaa > 1;
     Image depth = MakeImage(g.render.width, g.render.height, g.depthFmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                            VK_IMAGE_ASPECT_DEPTH_BIT);  // the layer adds SAMPLED
+                            VK_IMAGE_ASPECT_DEPTH_BIT, kSamples);  // the layer adds SAMPLED
+    // --msaa: multisampled colour targets, resolved into hdr / ldr at the end of each pass
+    Image hdrMs, ldrMs;
+    if (msaa) {
+        hdrMs = MakeImage(g.render.width, g.render.height, kHdr, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT, kSamples);
+        ldrMs = MakeImage(g.render.width, g.render.height, kHdr, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT, kSamples);
+    }
     Image easu = MakeImage(g.out.width, g.out.height, kPost, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     Image rcas = MakeImage(g.out.width, g.out.height, kPost, kTarget, VK_IMAGE_ASPECT_COLOR_BIT);
     // (the depth view isn't used by the app; TF3's own depth view has both aspects)
 
     const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkRenderPass rpScene = MakeRenderPass(kHdr, RO, true, Load::Clear);
-    VkRenderPass rpSceneMore = MakeRenderPass(kHdr, RO, true, Load::KeepAll);  // the other threads' parts
-    VkRenderPass rpTonemap = MakeRenderPass(kHdr, RO, true, Load::KeepDepth);
+    VkRenderPass rpScene = MakeRenderPass(kHdr, RO, true, Load::Clear, kSamples);
+    VkRenderPass rpSceneMore = MakeRenderPass(kHdr, RO, true, Load::KeepAll, kSamples);  // the other threads' parts
+    VkRenderPass rpTonemap = MakeRenderPass(kHdr, RO, true, Load::KeepDepth, kSamples);
     VkRenderPass rpPost = MakeRenderPass(kPost, RO, false, Load::Clear);
     VkRenderPass rpFinal = MakeRenderPass(g.swapFmt, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, false, Load::Clear);
-    VkFramebuffer fbScene = MakeFramebuffer(rpScene, {hdr.view, depth.view}, g.render);
-    VkFramebuffer fbTonemap = MakeFramebuffer(rpTonemap, {ldr.view, depth.view}, g.render);
+    VkFramebuffer fbScene = msaa ? MakeFramebuffer(rpScene, {hdrMs.view, depth.view, hdr.view}, g.render)
+                                 : MakeFramebuffer(rpScene, {hdr.view, depth.view}, g.render);
+    VkFramebuffer fbTonemap = msaa ? MakeFramebuffer(rpTonemap, {ldrMs.view, depth.view, ldr.view}, g.render)
+                                   : MakeFramebuffer(rpTonemap, {ldr.view, depth.view}, g.render);
     VkFramebuffer fbEasu = MakeFramebuffer(rpPost, {easu.view}, g.out);
     VkFramebuffer fbRcas = MakeFramebuffer(rpPost, {rcas.view}, g.out);
     std::vector<VkFramebuffer> fbFinal;
@@ -971,8 +1013,8 @@ int main(int argc, char** argv) {
 
     // ---- pipelines ----
 #define SPV(a) a, sizeof a
-    VkPipeline pScene = MakePipeline({SPV(kSceneVert), SPV(kSceneFrag), plScene, rpScene, true});
-    VkPipeline pTonemap = MakePipeline({SPV(kFullscreenVert), SPV(kTonemapFrag), plTonemap, rpTonemap});
+    VkPipeline pScene = MakePipeline({SPV(kSceneVert), SPV(kSceneFrag), plScene, rpScene, true, kSamples});
+    VkPipeline pTonemap = MakePipeline({SPV(kFullscreenVert), SPV(kTonemapFrag), plTonemap, rpTonemap, false, kSamples});
     VkPipeline pEasu = MakePipeline({SPV(kFullscreenVert), SPV(kEasuFrag), plFsr, rpPost});
     VkPipeline pRcas = MakePipeline({SPV(kFullscreenVert), SPV(kRcasFrag), plFsr, rpPost});
     VkPipeline pBlit = MakePipeline({SPV(kFullscreenVert), SPV(kBlitFrag), plTex, rpFinal});

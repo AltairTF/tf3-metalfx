@@ -51,13 +51,31 @@ if(NOT WIN32)
   set(LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../layer")
   compile_shaders(LAYER_SHADERS "${LAYER_DIR}/shaders"
     camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag)
-  add_library(VkLayer_tf3_dlss SHARED "${LAYER_DIR}/src/layer.cpp" ngx_stub.cpp ${LAYER_SHADERS})
+  add_custom_command(OUTPUT "${GEN_DIR}/camera_mv_ms.spv.inc"
+    COMMAND "${GLSLANG}" --target-env vulkan1.1 -V -x -DDEPTH_MS -o "${GEN_DIR}/camera_mv_ms.spv.inc" "${LAYER_DIR}/shaders/camera_mv.comp"
+    DEPENDS "${LAYER_DIR}/shaders/camera_mv.comp" COMMENT "Compiling camera_mv.comp (DEPTH_MS)")
+  list(APPEND LAYER_SHADERS "${GEN_DIR}/camera_mv_ms.spv.inc")
+  set(LAYER_EXTRA "")
+  if(APPLE)  # MetalFX bridge (macOS build of the layer)
+    enable_language(OBJCXX)
+    set(LAYER_EXTRA "${LAYER_DIR}/../macos/metalfx_bridge.mm")
+    set_source_files_properties("${LAYER_EXTRA}" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  endif()
+  add_library(VkLayer_tf3_dlss SHARED "${LAYER_DIR}/src/layer.cpp" ngx_stub.cpp ${LAYER_EXTRA} ${LAYER_SHADERS})
+  if(APPLE)
+    target_include_directories(VkLayer_tf3_dlss PRIVATE "${LAYER_DIR}/../macos")
+    target_compile_definitions(VkLayer_tf3_dlss PRIVATE VK_USE_PLATFORM_METAL_EXT)
+    target_link_libraries(VkLayer_tf3_dlss PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation"
+                          "-framework AppKit" "-framework CoreGraphics")
+  endif()
   target_include_directories(VkLayer_tf3_dlss PRIVATE "${DLSS_SDK}/include" "${GEN_DIR}"
                              "${LAYER_DIR}/../third_party/ffx-api/include")
   target_link_libraries(VkLayer_tf3_dlss PRIVATE Vulkan::Headers)
   # the FidelityFX header marks its (unused here) exports with __declspec
   target_compile_options(VkLayer_tf3_dlss PRIVATE "-D__declspec(x)=")
-  target_link_options(VkLayer_tf3_dlss PRIVATE -Wl,--no-undefined)
+  if(NOT APPLE)
+    target_link_options(VkLayer_tf3_dlss PRIVATE -Wl,--no-undefined)
+  endif()
   set_target_properties(VkLayer_tf3_dlss PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/layer")
   configure_file(VkLayer_tf3_dlss_linux.json "${CMAKE_BINARY_DIR}/layer/VkLayer_tf3_dlss.json" COPYONLY)
 endif()

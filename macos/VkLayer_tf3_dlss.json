@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_TF3_dlss",
+    "type": "GLOBAL",
+    "library_path": "./VkLayer_tf3_dlss.dylib",
+    "api_version": "1.4.335",
+    "implementation_version": "100",
+    "description": "TF3-DLSS macOS port (MetalFX). Enabled through Steam launch options (VK_ADD_LAYER_PATH / VK_INSTANCE_LAYERS).",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "tf3_NegotiateLoaderLayerInterfaceVersion"
+    }
+  }
+}
