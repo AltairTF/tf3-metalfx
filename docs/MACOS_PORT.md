@@ -68,8 +68,8 @@ MIT source (AMD FidelityFX, Dear ImGui).
 3. Frame generation with MTLFXFrameInterpolator (macOS 26+, supported on the M4). TF3 draws its UI after
    the blit, so the MetalFX output is a free UI-less image, which is what OptiScaler's HUDfix has to search
    for. Phases: harness prototype, in game with the UI interpolated, then a separate UI texture.
-   Prototype done (frame_gen=1, off by default), working in the harness; the in-game test is next. MetalFX
-   takes the UI out of the finished frame itself (uiTextureComposited), so no separate UI texture is needed.
+   Prototype done (frame_gen=1, off by default). Works in the harness; in game it is smooth but the map
+   labels shake, there is tearing, and it costs ~6.3 ms (see "Roadmap step 3" below). Stays experimental.
 4. Reactive mask (MetalFX reactiveMaskTexture, macOS 14.4+) for smoke, particles, water and glass, only if
    ghosting on smoke shows up in game.
 5. Optional: an in-game menu (Dear ImGui), FSR 3.1 built from source on MoltenVK as a second backend.
@@ -280,5 +280,19 @@ MIT source (AMD FidelityFX, Dear ImGui).
 - Known limits: the info box is drawn into the upscaled image, so MetalFX moves it with the scene (it shakes
   in generated frames); the UI separation needs the game's blit to copy the upscaled image unchanged (true in
   the harness, to be checked in game with Ctrl+Shift+G); frame_gen=1 needs a restart; macOS 26+.
-- In-game test to do: frame_gen=1 at 50%, Ctrl+Shift+F to compare, Ctrl+Shift+G while panning, perf=1 for
-  the "frame generation GPU" line.
+- 2026-10-15 IN-GAME RESULT (50%, 1280x720 -> 2560x1440, LG UltraFine 5K at 60 Hz; build-macos/tf3_dlss.run8-fg.log):
+  runs without errors (about 1000 generated frames, Ctrl+Shift+F / G work). The game already asked for FIFO
+  with 3 images. Interpolation GPU 6.2-8.2 ms per generated frame (median 6.3). Game frame rate with
+  frame generation 23-29 fps (34-42 ms), without it 38-47 fps in the same session, so near cities it falls
+  below 30 and the 60 Hz screen gets an uneven mix of generated and repeated frames. The user: smooth, but
+  "bastante tearing", the UI "balançando" (shaking), and bad near a city.
+  The two Ctrl+Shift+G dumps had a still camera (only the info box text changed), so they show no motion,
+  but they confirm that the game's blit copies the upscaled image unchanged (99.5% of the pixels identical
+  outside the UI) and that the generated frame carries the current frame's UI. The UI shaking follows from
+  that: labels tied to the map (stations, vehicle icons, town names) are UI, so MetalFX puts them where they
+  are in the current frame over a scene half a frame behind; they jump back and forth on every shown frame.
+  The info box shakes for the opposite reason (it is in the image MetalFX moves). The cause of the tearing is
+  not known yet (with FIFO the screen itself should not tear: it may be seams in the interpolated image or the
+  uneven pacing below 30 fps).
+  Conclusion for now: frame generation stays experimental and off by default. On a base M4 with a 60 Hz
+  screen it can at best turn 30 fps into 60, and costs about 6 ms of the 33 ms it has.
