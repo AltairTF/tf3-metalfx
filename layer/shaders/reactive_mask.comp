@@ -1,0 +1,32 @@
+#version 450
+// Reactive mask for MetalFX (macOS). The layer replays the game's draws of things without motion vectors
+// (smoke and other particles, rain, people and animals, water, optionally blended glass) into an RGBA8 target
+// at the render size; its alpha holds sum(class strength x coverage), clamped to 1 by the UNORM format.
+//   mode 0: copy that alpha into the R32F mask MetalFX reads (0 = use the history, 1 = only this frame).
+//   mode 1: debug (reactive_debug=1), at the output size: tint the upscaled image red where the mask is set.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D replayTarget;
+layout(set = 0, binding = 1, r32f) uniform image2D mask;
+layout(set = 0, binding = 2, rgba8) uniform image2D outImage;
+
+layout(push_constant) uniform Push {
+    ivec2 size;      // size of this pass's grid: render size (mode 0) or output size (mode 1)
+    ivec2 maskSize;  // render size
+    int mode;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    if (pc.mode == 0) {
+        float a = texelFetch(replayTarget, p, 0).a;
+        imageStore(mask, p, vec4(clamp(a, 0.0, 1.0), 0.0, 0.0, 0.0));
+        return;
+    }
+    ivec2 m = min(ivec2((vec2(p) + 0.5) * vec2(pc.maskSize) / vec2(pc.size)), pc.maskSize - 1);
+    float k = imageLoad(mask, m).r;
+    if (k <= 0.0) return;
+    vec4 c = imageLoad(outImage, p);
+    imageStore(outImage, p, vec4(mix(c.rgb, vec3(1.0, 0.0, 0.0), 0.6 * k), c.a));
+}

@@ -20,7 +20,7 @@
 // and reports its own CPU time per frame for recording, which the layer's hooks add to.
 //
 // Usage: fake_tf3 [--out DIR] [--frames N] [--width W --height H] [--scale S] [--tiles X Y]
-//                 [--threads N] [--window] [--validation] [--no-checks] [--speed K]
+//                 [--threads N] [--window] [--validation] [--no-checks] [--speed K] [--smoke]
 // The scripts (harness/run.sh, scripts/run_harness.ps1) enable the layer and set its variables.
 
 #ifdef _WIN32
@@ -57,6 +57,9 @@ const uint32_t kSceneVert[] = {
 const uint32_t kSceneFrag[] = {
 #include "scene_frag.spv.inc"
 };
+const uint32_t kSmokeFrag[] = {
+#include "smoke_frag.spv.inc"
+};
 const uint32_t kFullscreenVert[] = {
 #include "fullscreen_vert.spv.inc"
 };
@@ -89,6 +92,7 @@ struct Options {
     bool window = false, validation = false, checks = true;
     uint32_t msaa = 1;                     // --msaa N: scene + tonemap passes multisampled (TF3's MSAA option)
     float speed = 1.f;                     // --speed K: camera pan and cube K times faster (frame generation tests)
+    bool smoke = false;                    // --smoke: a blended, flickering puff with no motion vectors
 } g_opt;
 
 // Camera and cube positions per frame. Captures are made away from the changes of motion.
@@ -622,6 +626,7 @@ struct PipeDesc {
     VkRenderPass rp;
     bool scene = false;  // vertex input + depth test
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    bool blend = false;  // alpha blending, no depth writes (--smoke)
 };
 VkPipeline MakePipeline(const PipeDesc& p) {
     VkShaderModule vs = Shader(p.vs, p.vsBytes), fs = Shader(p.fs, p.fsBytes);
@@ -652,9 +657,19 @@ VkPipeline MakePipeline(const PipeDesc& p) {
     ms.rasterizationSamples = p.samples;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = ds.depthWriteEnable = p.scene;
+    if (p.blend) ds.depthWriteEnable = VK_FALSE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
     VkPipelineColorBlendAttachmentState cb{};
     cb.colorWriteMask = 0xF;
+    if (p.blend) {
+        cb.blendEnable = VK_TRUE;
+        cb.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        cb.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cb.colorBlendOp = VK_BLEND_OP_ADD;
+        cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cb.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cbs.attachmentCount = 1;
     cbs.pAttachments = &cb;
@@ -858,6 +873,7 @@ int main(int argc, char** argv) {
         else if (a == "--msaa") g_opt.msaa = (uint32_t)std::max(1, std::atoi(next()));
         else if (a == "--speed") g_opt.speed = std::max(0.f, (float)std::atof(next()));
         else if (a == "--no-checks") g_opt.checks = false;
+        else if (a == "--smoke") g_opt.smoke = true;
         else Die("unknown option %s (see the top of fake_tf3.cpp)", a.c_str());
     }
     if (g_opt.frames < 300 && g_opt.checks) {
@@ -923,7 +939,8 @@ int main(int argc, char** argv) {
                                               bind(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT)});
     VkPipelineLayout plScene = PipeLayout({dslView, dslMat}), plTex = PipeLayout({dslTex}),
                      plTonemap = PipeLayout({dslView, dslTex}),
-                     plFsr = PipeLayout({dslFsr}), plUi = PipeLayout({}, 32);
+                     plFsr = PipeLayout({dslFsr}), plUi = PipeLayout({}, 32),
+                     plSmoke = PipeLayout({dslView, dslMat}, 16);
 
     constexpr uint32_t kInFlight = 2, kMaterials = 16, kMatStride = 256;
     VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
@@ -955,7 +972,7 @@ int main(int argc, char** argv) {
     VkDescriptorSet viewSet[kInFlight];
     for (uint32_t i = 0; i < kInFlight; ++i) {
         viewUbo[i] = MakeBuffer(sizeof(ViewUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        inst[i] = MakeBuffer((VkDeviceSize)(tiles + 1) * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        inst[i] = MakeBuffer((VkDeviceSize)(tiles + 2) * 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);  // + cube, puff
         viewSet[i] = alloc(dslView);
     }
     Buffer mat = MakeBuffer(kMaterials * kMatStride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -1016,6 +1033,8 @@ int main(int argc, char** argv) {
     // ---- pipelines ----
 #define SPV(a) a, sizeof a
     VkPipeline pScene = MakePipeline({SPV(kSceneVert), SPV(kSceneFrag), plScene, rpScene, true, kSamples});
+    VkPipeline pSmoke = g_opt.smoke ? MakePipeline({SPV(kSceneVert), SPV(kSmokeFrag), plSmoke, rpScene, true, kSamples, true})
+                                    : VK_NULL_HANDLE;
     VkPipeline pTonemap = MakePipeline({SPV(kFullscreenVert), SPV(kTonemapFrag), plTonemap, rpTonemap, false, kSamples});
     VkPipeline pEasu = MakePipeline({SPV(kFullscreenVert), SPV(kEasuFrag), plFsr, rpPost});
     VkPipeline pRcas = MakePipeline({SPV(kFullscreenVert), SPV(kRcasFrag), plFsr, rpPost});
@@ -1113,6 +1132,7 @@ int main(int argc, char** argv) {
                 im[ty * g_opt.tilesX + tx] = Mul(Translate(-wallW / 2 + (tx + .5f) * tileW, -wallH / 2 + (ty + .5f) * tileH, kWallZ),
                                                  Scale(tileW, tileH, 1.f));
         im[tiles] = Translate(CubeX(f), 0.f, kCubeZ);
+        im[tiles + 1] = Mul(Translate(0.f, 0.f, kWallZ + 2.f), Scale(16.f, 16.f, 1.f));  // the puff's quad
 
         auto t0 = std::chrono::steady_clock::now();
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1156,6 +1176,17 @@ int main(int argc, char** argv) {
                 vkCmdBindVertexBuffers(cb, 0, 1, &cubeVb.buf, &zero);
                 vkCmdBindIndexBuffer(cb, cubeIb.buf, 0, VK_INDEX_TYPE_UINT16);
                 vkCmdDrawIndexed(cb, 36, 1, 0, 0, tiles);
+                if (pSmoke) {  // after the opaque scene, like TF3's particles; flickers and drifts on its own
+                    float puff[4] = {CamX(f) + 3.f * std::sin(0.31f * (float)f), 2.f * std::cos(0.23f * (float)f),
+                                     6.f, 0.45f + 0.35f * std::sin(0.9f * (float)f)};
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pSmoke);
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plSmoke, 0, 1, &viewSet[slot], 0, nullptr);
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plSmoke, 1, 1, &matSet, 1, &cubeOff);
+                    vkCmdPushConstants(cb, plSmoke, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof puff, puff);
+                    vkCmdBindVertexBuffers(cb, 0, 1, &quadVb.buf, &zero);
+                    vkCmdBindIndexBuffer(cb, quadIb.buf, 0, VK_INDEX_TYPE_UINT16);
+                    vkCmdDrawIndexed(cb, 6, 1, 0, 0, tiles + 1);
+                }
             }
             vkCmdEndRenderPass(cb);
             VKC(vkEndCommandBuffer(cb));

@@ -64,6 +64,7 @@ Depois siga os passos 3 e 4 da seção anterior.
   | **Ctrl+Shift+↑ / ↓** | Nitidez +/- 0,1 |
   | **Ctrl+Shift+S** | Tipo de nitidez: RCAS (padrão) ou CAS (a da versão 0.1), para comparar |
   | **Ctrl+Shift+A** | Nitidez extra no que se move: liga/desliga |
+  | **Ctrl+Shift+R** | Máscara reativa: ligada → ligada e mostrada em vermelho → desligada |
   | **Ctrl+Shift+F** | Geração de frames liga/desliga (se o jogo abriu com `frame_gen=1`) |
   | **Ctrl+Shift+G** | Grava um frame gerado e os vizinhos em `mvcap/`, ~3 s depois (para relatar problemas) |
 
@@ -76,6 +77,13 @@ Depois siga os passos 3 e 4 da seção anterior.
     0 desliga.
   - `overlay=1`: mostra a caixa de informação ao iniciar.
   - `mip_bias=auto`: deixa as texturas nítidas apesar da resolução menor (vale após reiniciar o jogo).
+  - `reactive=1`: máscara reativa (padrão; macOS 14.4+). Onde o jogo desenha fumaça, partículas,
+    chuva, pessoas, animais e água, que se movem sem vetores de movimento, o MetalFX passa a confiar
+    mais no frame novo e menos nos anteriores, e o rastro some. A força por tipo fica em
+    `reactive_particles`, `reactive_animated`, `reactive_water` e `reactive_transparent` (0 a 1);
+    `reactive_debug=1` pinta de vermelho onde a máscara age. Custa ~0,7 ms no M4.
+  - `upscale_to=1080`: o MetalFX gera no máximo essa altura e o jogo estica o resto; a interface
+    continua na resolução da tela (útil numa tela 4K com escala baixa).
   - `frame_gen=1` (experimental): geração de frames, explicada logo abaixo. Vale após reiniciar o jogo.
 
 ### Geração de frames (experimental)
@@ -271,8 +279,11 @@ Elas podem ir num arquivo `launch.env` ao lado do `launch.sh` (uma `VAR=valor` p
 ## 8. Limitações
 
 - Só macOS com Apple Silicon e MoltenVK (o driver Vulkan padrão do jogo no Mac).
-- Fumaça, nuvens e outros efeitos sem depth não têm vetores de movimento e podem deixar rastro.
-- Pessoas e animais (modelos com esqueleto) recebem só o movimento da câmera.
+- Fumaça, partículas, pessoas, animais e água não têm vetores de movimento próprios; a máscara reativa
+  reduz o rastro deles, mas nesses pontos a imagem fica um pouco menos suave.
+- Nuvens e outros efeitos de tela inteira recebem só o movimento da câmera.
+- O jogo apresenta os frames sem vsync: a 37-47 fps numa tela de 60 Hz o movimento fica irregular.
+  Um limite de 30 fps está planejado.
 - O MetalFX custa ~3,4 ms de GPU por frame no M4 base a 50% (cerca de 15% do frame a 40 fps).
   Chips Pro/Max devem ter folga bem maior.
 - Experimental: use por sua conta. Para voltar ao normal, basta apagar a opção de inicialização.

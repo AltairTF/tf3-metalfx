@@ -12,6 +12,18 @@ them.
   (`libMoltenVK.dylib`, MoltenVK_icd.json). KosmicKrisp is also shipped but the game doesn't select it.
 - Apple M4, macOS 27, 5120x2880 display, game fullscreen at 2560x1440.
 
+## Current state (2026-10-15)
+Good enough for a smooth image (user, after the in-game reactive-mask test). What runs by default on macOS:
+MetalFX Temporal with the layer's jitter, camera + vehicle motion vectors (MSAA-depth fix), RCAS with
+motion-adaptive sharpening, the reactive mask for particles / people and animals / water, mip bias, and the
+optional `upscale_to` cap. Frame generation (`frame_gen=1`) stays experimental and off.
+- Tested settings: game window 1920x1080 on the 4K LG UltraFine (macOS "looks like 1080p"), MSAA off, resolution
+  scale 60-75% (1152x648 and 1440x810 -> 1920x1080). 37-47 fps; the GPU is the limit (99% busy). MetalFX costs
+  2.4-3.3 ms, the reactive mask 0.6-0.8 ms, sharpening ~0.5 ms, motion vectors ~0.1 ms.
+- Open: the game presents with VK_PRESENT_MODE_IMMEDIATE (no vsync) and its frame time moves between 21 and
+  27 ms, so on a 60 Hz screen without VRR frames stay up for 1 or 2 refreshes unevenly (judder) and can tear.
+  Next step: a 30 fps lock (every frame exactly 2 refreshes), see "Next: 30 fps lock" at the end.
+
 ## How the layer gets loaded on macOS
 On Windows a `version.dll` stand-in enables the layer. macOS needs no proxy, because the Vulkan loader
 reads environment variables, and Steam can set them per game:
@@ -70,8 +82,8 @@ MIT source (AMD FidelityFX, Dear ImGui).
    for. Phases: harness prototype, in game with the UI interpolated, then a separate UI texture.
    Prototype done (frame_gen=1, off by default). Works in the harness; in game it is smooth but the map
    labels shake, there is tearing, and it costs ~6.3 ms (see "Roadmap step 3" below). Stays experimental.
-4. Reactive mask (MetalFX reactiveMaskTexture, macOS 14.4+) for smoke, particles, water and glass, only if
-   ghosting on smoke shows up in game.
+4. Reactive mask (MetalFX reactiveMaskTexture, macOS 14.4+) for smoke, particles, water and glass.
+   Done (reactive=1, default on); verified in the harness and in game (see "Roadmap step 4" below).
 5. Optional: an in-game menu (Dear ImGui), FSR 3.1 built from source on MoltenVK as a second backend.
 
 ## Verification method (all steps)
@@ -296,3 +308,60 @@ MIT source (AMD FidelityFX, Dear ImGui).
   uneven pacing below 30 fps).
   Conclusion for now: frame generation stays experimental and off by default. On a base M4 with a 60 Hz
   screen it can at best turn 30 fps into 60, and costs about 6 ms of the 33 ms it has.
+
+## Roadmap step 4: reactive mask (2026-10-15, verified in the harness and in game)
+- Why TF3 needs it: the game has no motion vectors; the layer makes them for the camera and for moving vehicles
+  only. Particles (smoke, steam: misc/particle.fs), rain (atmosphere/rain.fs), skinned meshes (people, animals:
+  mat/vs/skinning) and water (mat/fs/water*.fs) move on their own, so MetalFX reprojects their history with the
+  camera's motion and smears them.
+- How (layer.cpp "Reactive mask"): at vkCreateGraphicsPipelines the layer classifies each 3D colour pipeline
+  (depth test on, no tessellation): particle/rain and water by the fragment shader's SPIR-V names (noise0Tex,
+  tex + noise, waterDepthTex), animated by the skinned vertex shader, transparent = blended without depth writes.
+  For each kind with a strength > 0 it creates a copy of the pipeline for its own render pass (RGBA8 + D32 depth,
+  1 sample, depth test LEQUAL, no depth writes, alpha blend: dst.a += src.a x blend constant). Particles and
+  transparent keep the game's fragment shader (alpha = coverage); animated and water use reactive_const.frag
+  (alpha 1). New hook vkCmdPushConstants keeps the game's push constants. During the frame, draws of these
+  pipelines in the main 3D pass are remembered with their state (sets with dynamic offsets, vertex/index buffers,
+  push constants). In RecordMetalFx, after the motion-vector pass, the layer copies the R32F depth into its D32
+  buffer (through a buffer), replays the draws with this frame's jitter, and reactive_mask.comp copies the alpha
+  into an R32F mask. The scaler is created with reactiveMaskTextureEnabled (R32Float; a probe on the M4 accepted
+  R8, R16F, R32F and RGBA8). With no draws in a frame the mask is cleared. Pipelines get no copy when reactive=0
+  or their kind's strength is 0 at creation (restart to change). Ctrl+Shift+R cycles on -> on + red tint -> off.
+- Harness: fake_tf3 --smoke draws a blended, drifting, flickering puff (push constants, no depth writes) after the
+  opaque scene (classified "transparent"; the harness has no particle/skinned shaders). With
+  reactive_transparent=0.9: 1 pipeline copy, 1 draw replayed per frame, the recorded mask (mvcap *.reactive.bin)
+  covers 12-13% of the pixels with the puff's alpha x 0.9. All motion-vector checks pass with and without MSAA 2x;
+  Khronos validation shows only the 41 messages of the previous commits (VkEvent on portability, metal-objects
+  export, leaks at device destroy). Forcing the mask to 1 everywhere raises the output's frame-to-frame change from
+  4.80 to 5.77 (red channel, mean), so MetalFX does use the mask. reactive_debug=1 tints 12% of the final frame.
+  GPU cost in the harness is within run-to-run noise (one draw).
+- To check in game: the [reactive] log lines (pipeline copies by kind, draws replayed per frame by kind, draws of
+  copied pipelines outside the main 3D pass), reactive_debug=1 / Ctrl+Shift+R near smoke, a city (people) and
+  water, and the GPU time with perf=1 (the pass is inside the "upscaler" part).
+- 2026-10-15 IN-GAME RESULT (1152x648 and 1440x810 -> 1920x1080, MSAA off, perf=1; build-macos/tf3_dlss.log):
+  no errors, clean exit after 13778 frames. 100+ pipeline copies (42 particle, 58 animated). Per frame 126-715
+  particle draws and 1 water draw were replayed; no animated draws were seen in that session (no people on
+  screen, or they are drawn some other way: to check with the red tint in a busy street), and no draws of copied
+  pipelines happened outside the main 3D pass. Cost 0.6-0.8 ms (the "upscaler" part 3.5-3.8 ms with the mask,
+  2.9 ms after Ctrl+Shift+R turned it off). User: good enough for smoothing the image.
+
+## upscale_to and the perf=1 system line (2026-10-15)
+- `upscale_to=<lines>`: MetalFX writes an image at most that tall; the game's blit (std.fs, `texture(tex, uv)`)
+  stretches it with the layer's linear sampler, and the UI is drawn after it at the screen's resolution. The
+  output is also capped at MetalFX's maximum scale (mfx_max_scale, 3x on the M4). The mip bias follows the
+  upscaled size. Harness: passes at 3840x2160, scale 0.275. In game so far only with a 1920x1080 swapchain, where
+  upscale_to=1080 changes nothing; a 4K swapchain with scale 25-30% is still to be tried.
+- perf=1 adds a "system:" line: GPU busy % (IOAccelerator "Device Utilization %"), the process's and the busiest
+  threads' CPU, and a verdict (GPU, one game thread, or the 60 Hz display).
+- Harness manifest fix: the layer library is .dylib on macOS.
+
+## Next: 30 fps lock (planned)
+At 37-47 fps on a 60 Hz screen without VRR, frames are shown for 1 or 2 refreshes in an uneven pattern, which
+looks like jumps; with IMMEDIATE present it can also tear. Locking to 30 fps shows every frame for exactly 2
+refreshes: even motion and no tearing, at the cost of a lower frame rate and about one more frame of latency. The
+M4 has headroom for it (frame time 21-27 ms against 33.3 ms). Plan: first check whether the game has its own
+frame limit / vsync setting (settings.lua); otherwise a `fps_limit=30` option in the layer: FIFO present mode
+at swapchain creation (as frame_gen does) plus pacing at vkQueuePresentKHR (wait until 33.3 ms after the last
+present, or VK_GOOGLE_display_timing if MoltenVK honours it). Check in game: frame-time spread in the perf=1
+report and the look of a slow pan.
+

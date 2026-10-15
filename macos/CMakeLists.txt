@@ -21,7 +21,8 @@ set(LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../layer")
 set(GEN_DIR "${CMAKE_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GEN_DIR}")
 set(SHADER_INCS "")
-foreach(SRC camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag)
+foreach(SRC camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag reactive_mask.comp
+    reactive_const.frag)
   get_filename_component(NAME "${SRC}" NAME_WE)
   get_filename_component(EXT "${SRC}" LAST_EXT)
   if(EXT STREQUAL ".comp")
@@ -47,7 +48,7 @@ add_library(VkLayer_tf3_dlss SHARED "${LAYER_DIR}/src/layer.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/metalfx_bridge.mm" ${SHADER_INCS})
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/metalfx_bridge.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(VkLayer_tf3_dlss PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation"
-                      "-framework AppKit" "-framework CoreGraphics")
+                      "-framework AppKit" "-framework CoreGraphics" "-framework IOKit")
 target_include_directories(VkLayer_tf3_dlss PRIVATE "${VULKAN_INCLUDE}" "${DLSS_SDK}/include" "${GEN_DIR}"
                            "${CMAKE_CURRENT_SOURCE_DIR}"
                            "${LAYER_DIR}/../third_party/ffx-api/include")

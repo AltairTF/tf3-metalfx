@@ -18,9 +18,16 @@ void mfx_shutdown(void);
 
 // (Re)creates the temporal scaler for these sizes. colorVkFormat: the VkFormat of the colour input
 // (B10G11R11 float, RGBA16 float, RGBA8, BGRA8 or A2B10G10R10). Depth is R32 float, motion RG16 float,
-// output RGBA8 unorm.
-bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t colorVkFormat, char* err,
-                   int errLen);
+// output RGBA8 unorm. reactiveMask: the scaler also takes a reactive mask (R32 float, render size; macOS 14.4+),
+// which every MfxFrame must then provide.
+bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t colorVkFormat,
+                   bool reactiveMask, char* err, int errLen);
+
+// True if this macOS has MetalFX's reactive mask (14.4+).
+bool mfx_reactive_supported(void);
+
+// The largest upscale MetalFX Temporal accepts on this GPU, per axis (3 on the M4 with macOS 26/27).
+float mfx_max_scale(void);
 
 // Shared event helpers (the events come from vkExportMetalObjectsEXT).
 uint64_t mfx_event_value(void* sharedEvent);
@@ -39,6 +46,7 @@ struct MfxFrame {
     void* depth;
     void* motion;
     void* output;
+    void* reactive;          // reactive mask (R32 float, 0 = use the history, 1 = only this frame) or null
     void* eventIn;           // id<MTLSharedEvent>, signalled by the game's command buffer
     uint64_t waitValue;
     void* eventOut;          // id<MTLSharedEvent>, the game's command buffer waits for it
@@ -96,6 +104,15 @@ void mfx_fg_slot_wait(int slot);
 // GPU time of the interpolation command buffers, like mfx_gpu_ms / mfx_gpu_window.
 float mfx_fg_gpu_ms(void);
 void mfx_fg_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t* count);
+
+// perf=1: what limits the frame rate. GPU busy is the GPU driver's own statistic (IOAccelerator
+// "PerformanceStatistics", "Device Utilization %", all apps together), read 4 times a second on a background queue.
+// Thread CPU comes from the Mach thread list of this process.
+void mfx_sys_start(void);
+// Since the last call (or mfx_sys_start): average GPU busy % (-1 if unknown), the process's CPU % (100 = one core),
+// the busiest thread's CPU % and the three busiest threads as text ("Main Thread 97%, ...").
+void mfx_sys_window(double* gpuBusyPct, double* processCpuPct, double* topThreadPct, char* topThreads,
+                    int topThreadsLen);
 
 // Debug hotkeys on macOS (debug_keys=1): is this macOS virtual key held, and is our process the frontmost app.
 bool mfx_key_down(int macKeyCode);

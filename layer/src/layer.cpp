@@ -320,6 +320,7 @@ struct Config {
     float motionLimit = 10.f;       // output pixels per frame where the full motionSharpness applies
     int sharpenDebug = 0;       // 1 = tint where motion changes the sharpening (red = more)
     int frameGen = 0;           // macOS: 1 = MetalFX frame interpolation, one generated frame per game frame
+    int upscaleTo = 0;          // >0: the upscaler's image is at most this many lines; the game's blit stretches it
     float fsrSharpness = 0.5f;  // FSR's own sharpening (RCAS), 0..1 (0 = off)
     int overlay = 0;            // 1 = on-screen info box (upscaler, sizes, sharpness, jitter)
     float overlayX = 25.f;      // its top-left corner, percent of the screen from the left ...
@@ -335,6 +336,15 @@ struct Config {
     int perf = 0;               // 1 = measure what the layer costs (CPU and GPU), in the log and the info box
     float perfSeconds = 5.f;    // perf=1: averaging window, seconds
     int skipGameFsr = 0;        // don't draw the game's FSR 1 passes while DLSS/FSR 3.1 replaces their result
+    // MetalFX reactive mask (macOS): how much MetalFX trusts the current frame over its history where the game
+    // draws things without motion vectors, per kind of draw (0 = no mask for it). A kind that is 0 when the
+    // game starts stays off until a restart (its pipelines get no replay copy).
+    int reactive = 1;               // 0 = no reactive mask
+    float reactiveParticles = 0.9f; // smoke, steam, dust and other particles, rain
+    float reactiveAnimated = 0.6f;  // skinned meshes: people, animals
+    float reactiveWater = 0.3f;     // water surfaces (waves and reflections move without motion vectors)
+    float reactiveTransparent = 0.f;  // other blended 3D draws (glass, ...)
+    int reactiveDebug = 0;          // 1 = tint the image red where the mask is set
 } g_cfg;
 
 std::filesystem::path g_cfgPath;
@@ -438,6 +448,13 @@ bool LoadConfig() {
         else if (k == "perf_seconds") c.perfSeconds = std::min(std::max(fv, 1.f), 60.f);
         else if (k == "skip_game_fsr") c.skipGameFsr = iv;
         else if (k == "frame_gen") c.frameGen = iv;
+        else if (k == "upscale_to") c.upscaleTo = std::max(iv, 0);
+        else if (k == "reactive") c.reactive = iv;
+        else if (k == "reactive_particles") c.reactiveParticles = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "reactive_animated") c.reactiveAnimated = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "reactive_water") c.reactiveWater = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "reactive_transparent") c.reactiveTransparent = std::min(std::max(fv, 0.f), 1.f);
+        else if (k == "reactive_debug") c.reactiveDebug = iv;
         else Log("[cfg] unknown setting '%s' ignored", k.c_str());
     }
     g_cfg = c;
@@ -445,13 +462,15 @@ bool LoadConfig() {
         "sign %g,%g, fsr sign %g,%g) sharpness=%g fsr_sharpness=%g mip_bias=%s%g fsr_color=%s fsr_debug=%d overlay=%d debug_keys=%d "
         "dlss_dev=%d mv_scale=(%g,%g) reset_distance=%g mv_double=%d debug_view=%d cfg_live=%d log_every=%d perf=%d "
         "perf_seconds=%g skip_game_fsr=%d sharpen_type=%s motion_sharpness=%g motion_threshold=%g motion_limit=%g "
-        "sharpen_debug=%d frame_gen=%d",
+        "sharpen_debug=%d frame_gen=%d upscale_to=%d reactive=%d (particles %g, animated %g, water %g, "
+        "transparent %g, debug %d)",
         g_cfgPath.string().c_str(), c.enabled, PrefName(c.upscaler), c.preset, c.motionVectors, c.objectMotion,
         c.jitter, c.jitterPhases, c.jitterSignX, c.jitterSignY, c.fsrJitterSignX, c.fsrJitterSignY, c.sharpness, c.fsrSharpness,
         c.mipBiasAuto ? "auto " : "", c.mipBias, c.fsrColorSrgb ? "srgb" : "linear", c.fsrDebug, c.overlay,
         c.debugKeys, c.dlssDev, c.mvScaleX, c.mvScaleY, c.resetDistance, c.mvDouble, c.debugView, c.cfgLive, c.logEvery,
         c.perf, c.perfSeconds, c.skipGameFsr, c.sharpenType == 1 ? "cas" : "rcas", c.motionSharpness,
-        c.motionThreshold, c.motionLimit, c.sharpenDebug, c.frameGen);
+        c.motionThreshold, c.motionLimit, c.sharpenDebug, c.frameGen, c.upscaleTo, c.reactive, c.reactiveParticles,
+        c.reactiveAnimated, c.reactiveWater, c.reactiveTransparent, c.reactiveDebug);
     if (c.motionLimit <= c.motionThreshold)
         Log("[cfg] motion_limit (%g) should be above motion_threshold (%g)", c.motionLimit, c.motionThreshold);
     return true;
@@ -525,6 +544,7 @@ struct InstanceData {
     X(CmdBindIndexBuffer)                     \
     X(CmdSetViewport)                         \
     X(CmdSetScissor)                          \
+    X(CmdPushConstants)                       \
     X(CreateSampler)                          \
     X(QueueSubmit)                            \
     X(QueuePresentKHR)                        \
@@ -546,7 +566,7 @@ struct InstanceData {
     X(CreateComputePipelines)      \
     X(CmdDispatch)                 \
     X(CmdCopyBufferToImage)        \
-    X(CmdPushConstants)            \
+    X(CmdSetBlendConstants)        \
     X(CmdCopyBuffer)               \
     X(CmdCopyImageToBuffer)        \
     X(QueueWaitIdle)               \
@@ -718,6 +738,7 @@ struct ObjProbe {
     bool skinned = false;
 };
 
+constexpr uint8_t kRcNoneValue = 0;  // PipeInfo::react: not a reactive-mask draw (ReactClass, macOS)
 struct PipeInfo;
 struct CmdState {
     Kind kind = Kind::Other;
@@ -729,6 +750,7 @@ struct CmdState {
     bool fbIsScene = false;  // current framebuffer has a full-size, non-square depth buffer (main camera)
     bool jitterSet = false;  // jitter chosen for this frame (when DLSS was recorded)
     bool capture = false;    // this frame's MV/depth/colour are being copied out for analysis
+    bool capReactive = false;  // ... and the reactive mask (macOS)
     std::string capPhase;
     float jx = 0.f, jy = 0.f;  // jitter in render pixels
     uint32_t jitterIdx = 0, jitterPhases = 0;
@@ -777,6 +799,12 @@ struct CmdState {
     bool hasSceneVp = false;
     VkViewport sceneVp{};
     std::shared_ptr<const std::unordered_set<uint64_t>> moving;  // g_movingSnap when the pass began
+    // push constants as the game last set them (the reactive pass replays draws with them)
+    struct PushRange { VkShaderStageFlags stages; uint32_t offset, size; };
+    uint8_t push[256] = {};
+    PushRange pushRanges[4] = {};
+    uint32_t pushCount = 0;
+    VkPipelineLayout pushLayout = VK_NULL_HANDLE;
 };
 
 // Render state of a pipeline, for the scene draw log (Ctrl+Shift+L).
@@ -809,6 +837,8 @@ struct PipeInfo {
     bool hasVtx = false;
     PipeVtx vtx;
     bool screenPass = false;  // no depth test: a full-screen pass (not jittered by default)
+    uint8_t react = 0;                      // ReactClass of a 3D draw without motion vectors (macOS)
+    VkPipeline reactPipe = VK_NULL_HANDLE;  // its copy for the reactive mask pass
 };
 
 // Guards everything below. Recursive: the FSR runtime may record through the loader (and so
@@ -954,6 +984,7 @@ struct HotState {
     std::atomic<bool> jitter{false};           // ViewportJitterOn()
     std::atomic<bool> jitterScreen{false};     // jitter_screen_passes
     std::atomic<bool> jitterOther{false};      // jitter_other_targets
+    std::atomic<bool> react{false};            // reactive mask on: remember the draws that feed it
     std::atomic<uint32_t> inW{0}, inH{0};      // render size
     std::atomic<uint64_t> jitterFrame{UINT64_MAX};  // the frame jitterXY belongs to
     std::atomic<uint64_t> jitterXY{0};         // that frame's jitter, two floats
@@ -962,6 +993,30 @@ struct HotState {
 std::shared_ptr<const std::unordered_set<uint64_t>> g_movingSnap;
 VkExtent2D g_swapExtent = {0, 0};
 uint32_t g_sceneRenderW = 0;  // width of the scene depth buffer = render width
+
+// The size the upscaler writes for an inW x inH render: the screen, or less when upscale_to asks for fewer lines
+// or when MetalFX can't upscale that far (more than 3x). The game's blit samples the image with normalised
+// coordinates and our linear sampler, so it stretches a smaller image over the screen, and the UI it draws next
+// stays at the screen's resolution. Never smaller than the render size. Caller holds g_t.
+VkExtent2D UpscaleExtent(uint32_t inW, uint32_t inH, bool metalFx) {
+    VkExtent2D s = g_swapExtent;
+    if (!s.width || !s.height || !inW || !inH) return s;
+    double h = s.height;
+    if (g_cfg.upscaleTo > 0) h = std::min(h, (double)g_cfg.upscaleTo);
+#ifdef __APPLE__
+    if (metalFx) {
+        double k = mfx_max_scale();  // per axis
+        h = std::min(h, std::floor(inH * k));
+        h = std::min(h, std::floor(inW * k) * s.height / s.width);
+    }
+#else
+    (void)metalFx;
+#endif
+    h = std::max(h, (double)inH);
+    if (h >= s.height) return s;
+    uint32_t w = (uint32_t)std::lround(h * s.width / s.height);
+    return {std::max(w, inW), (uint32_t)h};
+}
 
 uint64_t g_frame = 0;
 uint64_t g_firstFsrFrame = 0;
@@ -1307,7 +1362,7 @@ uint32_t FindMemoryType(DeviceData* d, uint32_t typeBits, VkMemoryPropertyFlags 
 }
 
 bool CreateOwnImage(DeviceData* d, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImage* img,
-                    VkImageView* view) {
+                    VkImageView* view, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = fmt;
@@ -1333,7 +1388,7 @@ bool CreateOwnImage(DeviceData* d, uint32_t w, uint32_t h, VkFormat fmt, VkImage
     vi.image = *img;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.subresourceRange = {aspect, 0, 1, 0, 1};
     return d->CreateImageView(d->device, &vi, nullptr, view) == VK_SUCCESS;
 }
 
@@ -1404,7 +1459,8 @@ struct CaptureFrame {
     float jx = 0, jy = 0;
     // Copies of the readback buffers, taken right after the GPU finished, so the files can be written on
     // another thread: writing them on the game's thread stalled it and made the next frame's camera jump.
-    std::vector<char> mv, mvFinal, depth, color, out;
+    std::vector<char> mv, mvFinal, depth, color, out, reactive;
+    bool hasReactive = false;
     uint32_t w = 0, h = 0, outW = 0, outH = 0;
     int index = 0;
 };
@@ -1416,6 +1472,8 @@ struct Capture {
     char *mvPtr = nullptr, *depthPtr = nullptr, *colorPtr = nullptr;
     VkBuffer mvFinal = VK_NULL_HANDLE, out = VK_NULL_HANDLE;  // motion incl. objects; DLSS output
     char *mvFinalPtr = nullptr, *outPtr = nullptr;
+    VkBuffer reactive = VK_NULL_HANDLE;  // the reactive mask (macOS), R32 float
+    char* reactivePtr = nullptr;
     uint32_t outW = 0, outH = 0;
     bool outPending = false;  // this frame's DLSS output still to copy (after Evaluate)
     uint32_t w = 0, h = 0;
@@ -2226,6 +2284,7 @@ void UploadMvMatrices(const CmdState& cs) {
             f.frame = g_frame;
             f.phase = cs.capPhase;
             f.ubo = u;
+            f.hasReactive = cs.capReactive;
             std::memcpy(f.curPV, pv, 64);
             g_cap.pending.push_back(f);
         }
@@ -2260,7 +2319,8 @@ bool EnsureCaptureBuffers(DeviceData* d, uint32_t w, uint32_t h) {
             CreateBuffer(d, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.depth, &g_cap.depthPtr) &&
             CreateBuffer(d, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.color, &g_cap.colorPtr) &&
             CreateBuffer(d, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.mvFinal, &g_cap.mvFinalPtr) &&
-            CreateBuffer(d, outSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.out, &g_cap.outPtr)) {
+            CreateBuffer(d, outSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.out, &g_cap.outPtr) &&
+            CreateBuffer(d, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, props, &g_cap.reactive, &g_cap.reactivePtr)) {
             g_cap.w = w;
             g_cap.h = h;
             g_cap.outW = g_dlss.outW;
@@ -2319,6 +2379,7 @@ void SnapshotCapture(CaptureFrame& f) {
     f.depth.assign(g_cap.depthPtr, g_cap.depthPtr + n);
     f.color.assign(g_cap.colorPtr, g_cap.colorPtr + n);
     if (g_cap.outPtr) f.out.assign(g_cap.outPtr, g_cap.outPtr + (size_t)g_cap.outW * g_cap.outH * 4);
+    if (f.hasReactive && g_cap.reactivePtr) f.reactive.assign(g_cap.reactivePtr, g_cap.reactivePtr + n);
 }
 
 // Write one recorded frame (half resolution, every other pixel) plus a JSON description.
@@ -2348,6 +2409,18 @@ void WriteCapture(const CaptureFrame& f) {
     dump(f.depth.data(), ".depth.bin", f.w, f.h);        // depth as the MV pass read it, R32 float
     dump(f.color.data(), ".color.bin", f.w, f.h);        // DLSS input colour, R11G11B10 float
     if (!f.out.empty()) dump(f.out.data(), ".out.bin", f.outW, f.outH);  // DLSS output, RGBA8
+    if (!f.reactive.empty()) {  // MetalFX's reactive mask, R32 float
+        dump(f.reactive.data(), ".reactive.bin", f.w, f.h);
+        const float* m = reinterpret_cast<const float*>(f.reactive.data());
+        size_t n = (size_t)f.w * f.h, set = 0;
+        float mx = 0.f;
+        for (size_t i = 0; i < n; ++i) {
+            if (m[i] > 0.f) ++set;
+            mx = std::max(mx, m[i]);
+        }
+        Log("[record] reactive mask of frame %llu: %.2f%% of the pixels set, max %.3f", (unsigned long long)f.frame,
+            100.0 * (double)set / (double)std::max<size_t>(n, 1), mx);
+    }
     std::ofstream j(dir / (std::string(base) + ".json"));
     auto arr = [&](const float* v, int n) {
         std::string out = "[";
@@ -3423,6 +3496,9 @@ void PerfPresent() {
         g_pw.startTsc = tsc;
         g_pw.scopeTicks = PerfScopeTicks();
         g_pw.overlayLine = "PERF: MEASURING...";
+#ifdef __APPLE__
+        mfx_sys_start();
+#endif
         Log("[perf] measuring the layer's cost: a report every %g s (perf_seconds)", g_cfg.perfSeconds);
         return;
     }
@@ -3445,6 +3521,10 @@ void PerfPresent() {
                       g_dlss.outW, g_dlss.outH);
     else std::snprintf(up, sizeof up, "%s %ux%u -> %ux%u", BackendName(g_dlss.backend), g_dlss.inW, g_dlss.inH,
                        g_dlss.outW, g_dlss.outH);
+    if (running && g_dlss.outH != g_swapExtent.height) {
+        size_t len = std::strlen(up);
+        std::snprintf(up + len, sizeof up - len, " (screen %ux%u)", g_swapExtent.width, g_swapExtent.height);
+    }
     Log("[perf] %.1f s, %.0f frames: %.2f ms per frame (%.1f fps), slowest 1%%: %.2f ms | %s | skip_game_fsr=%d",
         winMs / 1000.0, n, avg, 1000.0 / avg, p99, up, g_cfg.skipGameFsr);
 
@@ -3505,8 +3585,26 @@ void PerfPresent() {
         Log("[perf]   frame generation GPU: %.3f ms per generated frame (median, %.1f%% of the game's frame); mean "
             "%.3f, slowest %.3f ms, %u frames generated",
             fgMed, 100.0 * fgMed / avg, fgSum / fgN, fgMax, fgN);
+    // What limits the frame rate: a GPU that is busy nearly all the time, or one game thread that is.
+    double gpuBusy = -1.0, procCpu = 0.0, topThread = 0.0;
+    char threads[192] = {};
+    mfx_sys_window(&gpuBusy, &procCpu, &topThread, threads, sizeof threads);
+    double fps = 1000.0 / avg;
+    const char* limit = fps > 57.0 && fps < 61.0                ? "the display's 60 Hz (vsync)"
+                      : gpuBusy >= 90.0                            ? "the GPU"
+                      : topThread >= 85.0                          ? "the CPU (the busiest game thread)"
+                                                                   : "unclear (neither the GPU nor one thread is maxed)";
+    Log("[perf]   system: GPU busy %.0f%% (driver statistic, all apps), game CPU %.0f%% (100 = one core); busiest "
+        "threads: %s | limit: %s",
+        gpuBusy, procCpu, threads, limit);
 #endif
     char ov[96];
+#ifdef __APPLE__
+    if (gpuBusy >= 0.0)
+        std::snprintf(ov, sizeof ov, "GPU BUSY %.0f%%  TOP THREAD %.0f%%  %s %.1f MS", gpuBusy, topThread, upName,
+                      upMs);
+    else
+#endif
     if (g_gpu.frames)
         std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU %.2f MS  %s %.2f", cpuMs, gpuMs, upName, upMs);
     else std::snprintf(ov, sizeof ov, "LAYER CPU %.2f MS  GPU -", cpuMs);
@@ -3672,8 +3770,11 @@ std::vector<std::string> OverlayLines(Backend backend, const CmdState& cs, uint3
     else if (g_cfg.preset > 0)
         std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET %c", 'A' + g_cfg.preset - 1);
     else std::snprintf(b[0], sizeof b[0], "TF3-DLSS " TF3_DLSS_VERSION "  DLSS, PRESET AUTO");
-    std::snprintf(b[1], sizeof b[1], "%ux%u -> %ux%u (%d%%)", inW, inH, g_dlss.outW, g_dlss.outH,
-                  g_dlss.outW ? (int)std::lround(100.0 * inW / g_dlss.outW) : 0);
+    if (g_dlss.outH && g_dlss.outH != g_swapExtent.height)  // upscaled to less than the screen; the blit stretches it
+        std::snprintf(b[1], sizeof b[1], "%ux%u -> %ux%u -> %uP", inW, inH, g_dlss.outW, g_dlss.outH,
+                      g_swapExtent.height);
+    else std::snprintf(b[1], sizeof b[1], "%ux%u -> %ux%u (%d%%)", inW, inH, g_dlss.outW, g_dlss.outH,
+                       g_dlss.outW ? (int)std::lround(100.0 * inW / g_dlss.outW) : 0);
 #ifdef __APPLE__
     if (backend == Backend::MetalFx && mfx_gpu_ms() > 0.f) {  // MetalFX's own GPU time, median of the last frames
         size_t n = std::strlen(b[1]);
@@ -3851,6 +3952,8 @@ struct MetalFx {
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
     VkFormat confFmt = VK_FORMAT_UNDEFINED;
     bool deviceExtEnabled = false;  // VK_EXT_metal_objects was enabled at device creation
+    bool confReactive = false;      // the scaler was created with a reactive mask
+    bool maskThisFrame = false;     // RecordReactive made this frame's mask
     int encodeErrors = 0;
     // the last frame recorded, for frame generation at present
     uint64_t lastFrame = UINT64_MAX;
@@ -3866,6 +3969,556 @@ void* MtlTexture(DeviceData* d, VkImage img) {
     oi.pNext = &ti;
     g_mfx.exportObjects(d->device, &oi);
     return (void*)ti.mtlTexture;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reactive mask (MetalFX): where the image has no usable motion vectors
+// ---------------------------------------------------------------------------------------------
+// TF3 has no motion vectors of its own. The layer computes them for the camera and for moving vehicles,
+// but smoke and other particles, rain, people and animals (skinned meshes) and water move on their own, so
+// MetalFX reprojects them with the camera's motion and drags their old image along: trails. A reactive mask
+// tells MetalFX, per pixel, to trust the current frame more than its history (0 = normal, 1 = no history).
+//
+// The mask is drawn from the game's own draws. When the game creates a pipeline for one of these kinds of
+// 3D draws (ReactClassify), the layer creates a copy of it (ReactClone) for its own render pass: an RGBA8
+// target at the render size plus a depth copy of the scene, depth test on and no depth writes, so hidden
+// parts don't count. Particles and blended draws keep the game's fragment shader, whose alpha is their
+// coverage; skinned meshes and water use reactive_const.frag (alpha 1). The blend adds alpha x the kind's
+// strength (blend constant alpha). While the game records the frame, every draw with such a pipeline is
+// remembered with its state (descriptor sets, vertex and index buffers, push constants), and after the scene
+// is finished the draws are replayed (RecordReactive) with this frame's jitter. reactive_mask.comp then
+// copies the alpha into the R32 float mask MetalFX reads.
+enum ReactClass : uint8_t { kRcNone, kRcParticle, kRcAnimated, kRcWater, kRcTransparent, kRcCount };
+const char* const kRcNames[kRcCount] = {"none", "particles", "animated", "water", "transparent"};
+const uint32_t kReactConstFsSpirv[] = {
+#include "reactive_const_frag.spv.inc"
+};
+const uint32_t kReactMaskSpirv[] = {
+#include "reactive_mask.spv.inc"
+};
+constexpr size_t kReactMax = 8192;  // replayed draws per frame
+
+std::unordered_map<VkShaderModule, uint8_t> g_moduleReact;  // fragment shaders recognised by their names
+
+float ReactStrength(uint8_t cls) {
+    switch (cls) {
+        case kRcParticle: return g_cfg.reactiveParticles;
+        case kRcAnimated: return g_cfg.reactiveAnimated;
+        case kRcWater: return g_cfg.reactiveWater;
+        case kRcTransparent: return g_cfg.reactiveTransparent;
+        default: return 0.f;
+    }
+}
+
+// From the SPIR-V debug names of a fragment shader: particle.fs (noise0Tex), rain.fs (tex + noise), the
+// water shaders (waterDepthTex).
+uint8_t ReactModuleClass(const uint32_t* w, size_t words) {
+    if (words < 5 || w[0] != 0x07230203u) return kRcNone;
+    bool fragment = false, noise0 = false, noise = false, tex = false, water = false;
+    for (size_t i = 5; i < words;) {
+        uint32_t op = w[i] & 0xffffu, n = w[i] >> 16;
+        if (!n || i + n > words) break;
+        if (op == 15 && n >= 2 && w[i + 1] == 4) fragment = true;  // OpEntryPoint Fragment
+        else if (op == 5 && n >= 3) {                              // OpName
+            const char* str = reinterpret_cast<const char*>(&w[i + 2]);
+            std::string nm(str, strnlen(str, (n - 2) * 4));
+            if (nm == "noise0Tex") noise0 = true;
+            else if (nm == "noise") noise = true;
+            else if (nm == "tex") tex = true;
+            else if (nm == "waterDepthTex") water = true;
+        }
+        i += n;
+    }
+    if (!fragment) return kRcNone;
+    if (noise0 || (noise && tex)) return kRcParticle;
+    if (water) return kRcWater;
+    return kRcNone;
+}
+
+struct ReactDraw {
+    VkPipeline pipe = VK_NULL_HANDLE;  // the copy
+    uint8_t cls = kRcNone;
+    std::vector<BoundSet> sets;
+    std::pair<VkBuffer, VkDeviceSize> vb[16] = {};
+    VkBuffer ib = VK_NULL_HANDLE;
+    VkDeviceSize ibOff = 0;
+    VkIndexType ibType = VK_INDEX_TYPE_UINT16;
+    bool indexed = false;
+    uint32_t count = 0, instances = 0, first = 0, firstInstance = 0;
+    int32_t vertexOffset = 0;
+    VkPipelineLayout pushLayout = VK_NULL_HANDLE;
+    uint32_t pushCount = 0;
+    CmdState::PushRange pushRanges[4] = {};
+    uint8_t push[256] = {};
+};
+
+struct Reactive {
+    bool baseTried = false, baseOk = false;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkShaderModule constFs = VK_NULL_HANDLE;
+    uint32_t clones = 0, cloneFailures = 0;
+    uint32_t clonesByClass[kRcCount] = {};
+    // per render size
+    bool failed = false;
+    uint32_t w = 0, h = 0;
+    VkImage rt = VK_NULL_HANDLE, depth = VK_NULL_HANDLE, mask = VK_NULL_HANDLE;
+    VkImageView rtView = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE, maskView = VK_NULL_HANDLE;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    // reactive_mask.comp
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
+    VkPipeline maskPipe = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkImageView boundOut = VK_NULL_HANDLE;
+    bool used = false;
+    // this frame's draws (from every command buffer of the frame)
+    uint64_t frame = UINT64_MAX;
+    std::vector<ReactDraw> draws;
+    uint32_t drawsByClass[kRcCount] = {};
+    uint64_t maskFrame = UINT64_MAX;  // the frame the mask was last drawn for (reactive_debug)
+    std::atomic<uint64_t> outside{0};  // draws of copied pipelines outside the main 3D pass (not replayed)
+} g_react;
+
+// The render pass and the constant fragment shader, needed before the first copy. Caller holds g_t.
+bool ReactEnsureBase(DeviceData* d) {
+    if (g_react.baseTried) return g_react.baseOk;
+    g_react.baseTried = true;
+    if (!mfx_reactive_supported()) {
+        Log("[reactive] MetalFX's reactive mask needs macOS 14.4 or newer; off");
+        return false;
+    }
+    VkAttachmentDescription att[2] = {};
+    att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    att[1] = att[0];
+    att[1].format = VK_FORMAT_D32_SFLOAT;
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &color;
+    sub.pDepthStencilAttachment = &depth;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 2;
+    rpi.pAttachments = att;
+    rpi.subpassCount = 1;
+    rpi.pSubpasses = &sub;
+    if (d->CreateRenderPass(d->device, &rpi, nullptr, &g_react.rp) != VK_SUCCESS) {
+        g_react.rp = VK_NULL_HANDLE;
+        Log("[reactive] couldn't create the render pass; off");
+        return false;
+    }
+    VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    si.codeSize = sizeof kReactConstFsSpirv;
+    si.pCode = kReactConstFsSpirv;
+    if (d->CreateShaderModule(d->device, &si, nullptr, &g_react.constFs) != VK_SUCCESS) {
+        Log("[reactive] couldn't create the fragment shader; off");
+        return false;
+    }
+    g_react.baseOk = true;
+    Log("[reactive] reactive mask ready (strengths: particles %g, animated %g, water %g, transparent %g)",
+        g_cfg.reactiveParticles, g_cfg.reactiveAnimated, g_cfg.reactiveWater, g_cfg.reactiveTransparent);
+    return true;
+}
+
+// Which kind of reactive draw a game pipeline makes (kRcNone: not one). Only 3D draws into colour with a
+// depth test and no tessellation (terrain). Caller holds g_t.
+uint8_t ReactClassify(const VkGraphicsPipelineCreateInfo& ci) {
+    if (!ci.renderPass || !ci.pDepthStencilState || !ci.pDepthStencilState->depthTestEnable || !ci.pColorBlendState ||
+        !ci.pColorBlendState->attachmentCount || !ci.pColorBlendState->pAttachments[0].colorWriteMask ||
+        (ci.pRasterizationState && ci.pRasterizationState->rasterizerDiscardEnable))
+        return kRcNone;
+    if (ci.pInputAssemblyState && !IsTriangles(ci.pInputAssemblyState->topology)) return kRcNone;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    for (uint32_t k = 0; k < ci.stageCount; ++k) {
+        VkShaderStageFlagBits st = ci.pStages[k].stage;
+        if (st == VK_SHADER_STAGE_VERTEX_BIT) vs = ci.pStages[k].module;
+        else if (st == VK_SHADER_STAGE_FRAGMENT_BIT) fs = ci.pStages[k].module;
+        else return kRcNone;  // tessellation / geometry shaders: terrain, grass
+    }
+    if (!vs || !fs) return kRcNone;
+    auto m = g_moduleReact.find(fs);
+    if (m != g_moduleReact.end()) return m->second;
+    auto v = g_vsInfo.find(vs);
+    if (v != g_vsInfo.end() && v->second.skinned) return kRcAnimated;
+    if (ci.pColorBlendState->pAttachments[0].blendEnable && !ci.pDepthStencilState->depthWriteEnable)
+        return kRcTransparent;
+    return kRcNone;
+}
+
+// The copy of a game pipeline for the reactive pass (the create info as the driver got it). Call without g_t.
+VkPipeline ReactClone(DeviceData* d, const VkGraphicsPipelineCreateInfo& game, uint8_t cls) {
+    {
+        TLock lk(g_t);
+        if (!ReactEnsureBase(d)) return VK_NULL_HANDLE;
+    }
+    VkGraphicsPipelineCreateInfo ci = game;
+    ci.pNext = nullptr;
+    ci.flags = 0;
+    ci.basePipelineHandle = VK_NULL_HANDLE;
+    ci.basePipelineIndex = -1;
+    ci.renderPass = g_react.rp;
+    ci.subpass = 0;
+    ci.pTessellationState = nullptr;
+    std::vector<VkPipelineShaderStageCreateInfo> stages(game.pStages, game.pStages + game.stageCount);
+    bool constFs = cls == kRcAnimated || cls == kRcWater;  // their own colour doesn't matter, only coverage
+    for (auto& st : stages) {
+        st.pNext = nullptr;
+        st.flags = 0;
+        if (st.stage == VK_SHADER_STAGE_FRAGMENT_BIT && constFs) {
+            st.module = g_react.constFs;
+            st.pName = "main";
+            st.pSpecializationInfo = nullptr;
+        }
+    }
+    ci.pStages = stages.data();
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    ci.pViewportState = &vp;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    if (game.pRasterizationState) rs = *game.pRasterizationState;
+    rs.pNext = nullptr;
+    rs.rasterizerDiscardEnable = VK_FALSE;
+    rs.lineWidth = 1.f;
+    ci.pRasterizationState = &rs;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ci.pMultisampleState = &ms;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_FALSE;
+    VkCompareOp op = game.pDepthStencilState->depthCompareOp;
+    ds.depthCompareOp = op == VK_COMPARE_OP_GREATER || op == VK_COMPARE_OP_GREATER_OR_EQUAL
+                            ? VK_COMPARE_OP_GREATER_OR_EQUAL
+                            : VK_COMPARE_OP_LESS_OR_EQUAL;  // the same surface drawn again must pass
+    ci.pDepthStencilState = &ds;
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;  // the kind's strength
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    ba.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+    ci.pColorBlendState = &cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dsi.dynamicStateCount = 3;
+    dsi.pDynamicStates = dyn;
+    ci.pDynamicState = &dsi;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    // straight to the driver: our own CreateGraphicsPipelines hook must not patch or track it
+    if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS)
+        pipe = VK_NULL_HANDLE;
+    TLock lk(g_t);
+    if (pipe) {
+        ++g_react.clones;
+        ++g_react.clonesByClass[cls];
+        if (g_react.clones <= 4 || g_react.clones % 100 == 0)
+            Log("[reactive] pipeline copy %u (%s, %s fragment shader); by kind: particles %u, animated %u, water %u, "
+                "transparent %u", g_react.clones, kRcNames[cls], constFs ? "constant" : "the game's",
+                g_react.clonesByClass[kRcParticle], g_react.clonesByClass[kRcAnimated], g_react.clonesByClass[kRcWater],
+                g_react.clonesByClass[kRcTransparent]);
+    } else if (g_react.cloneFailures++ < 5)
+        Log("[reactive] couldn't copy a %s pipeline; its draws stay out of the mask", kRcNames[cls]);
+    return pipe;
+}
+
+// A game draw with a copied pipeline in the main 3D pass: remember it for the replay. Caller holds g_t.
+void ReactRecordDraw(const CmdState& cs, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
+                     int32_t vertexOffset, uint32_t firstInstance) {
+    if (g_react.frame != g_frame) {
+        g_react.frame = g_frame;
+        g_react.draws.clear();
+        for (auto& n : g_react.drawsByClass) n = 0;
+    }
+    if (g_react.draws.size() >= kReactMax || ReactStrength(cs.pipe->react) <= 0.f) return;
+    ReactDraw& rd = g_react.draws.emplace_back();
+    rd.pipe = cs.pipe->reactPipe;
+    rd.cls = cs.pipe->react;
+    rd.sets = cs.sets;
+    std::copy(std::begin(cs.vb), std::end(cs.vb), rd.vb);
+    rd.ib = cs.ib;
+    rd.ibOff = cs.ibOff;
+    rd.ibType = cs.ibType;
+    rd.indexed = indexed;
+    rd.count = count;
+    rd.instances = instances;
+    rd.first = first;
+    rd.vertexOffset = vertexOffset;
+    rd.firstInstance = firstInstance;
+    rd.pushLayout = cs.pushLayout;
+    rd.pushCount = cs.pushCount;
+    std::copy(std::begin(cs.pushRanges), std::end(cs.pushRanges), rd.pushRanges);
+    std::memcpy(rd.push, cs.push, sizeof rd.push);
+    ++g_react.drawsByClass[rd.cls];
+}
+
+// Images, framebuffer and the mask compute pass for the render size. Caller holds g_t.
+bool ReactEnsureImages(DeviceData* d, uint32_t w, uint32_t h) {
+    if (g_react.failed || !g_react.baseOk) return false;
+    if (!g_react.maskPipe) {
+        g_react.failed = true;  // cleared on success
+        VkDescriptorSetLayoutBinding b[3] = {};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 3;
+        li.pBindings = b;
+        if (d->CreateDescriptorSetLayout(d->device, &li, nullptr, &g_react.setLayout) != VK_SUCCESS) return false;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &g_react.setLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        if (d->CreatePipelineLayout(d->device, &pli, nullptr, &g_react.pipeLayout) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo si{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        si.codeSize = sizeof kReactMaskSpirv;
+        si.pCode = kReactMaskSpirv;
+        VkShaderModule mod;
+        if (d->CreateShaderModule(d->device, &si, nullptr, &mod) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = g_react.pipeLayout;
+        VkResult r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_react.maskPipe);
+        d->DestroyShaderModule(d->device, mod, nullptr);
+        if (r != VK_SUCCESS) {
+            g_react.maskPipe = VK_NULL_HANDLE;
+            return false;
+        }
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 1;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (d->CreateDescriptorPool(d->device, &pi, nullptr, &g_react.pool) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = g_react.pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g_react.setLayout;
+        if (d->AllocateDescriptorSets(d->device, &ai, &g_react.set) != VK_SUCCESS) return false;
+        g_react.failed = false;
+    }
+    if (g_react.w != w || g_react.h != h || !g_react.mask) {
+        if (g_react.used) d->DeviceWaitIdle(d->device);
+        if (g_react.fb) d->DestroyFramebuffer(d->device, g_react.fb, nullptr);
+        for (VkImageView v : {g_react.rtView, g_react.depthView, g_react.maskView})
+            if (v) d->DestroyImageView(d->device, v, nullptr);
+        for (VkImage i : {g_react.rt, g_react.depth, g_react.mask})
+            if (i) d->DestroyImage(d->device, i, nullptr);
+        g_react.fb = VK_NULL_HANDLE;
+        g_react.rt = g_react.depth = g_react.mask = VK_NULL_HANDLE;
+        g_react.rtView = g_react.depthView = g_react.maskView = VK_NULL_HANDLE;
+        bool ok =
+            CreateOwnImage(d, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &g_react.rt,
+                           &g_react.rtView) &&
+            CreateOwnImage(d, w, h, VK_FORMAT_D32_SFLOAT,
+                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           &g_react.depth, &g_react.depthView, VK_IMAGE_ASPECT_DEPTH_BIT) &&
+            CreateOwnImage(d, w, h, VK_FORMAT_R32_SFLOAT,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // cleared when unused; recordings
+                           &g_react.mask, &g_react.maskView) &&
+            CreateBuffer(d, (VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &g_react.staging, nullptr);
+        if (ok) {
+            VkImageView views[2] = {g_react.rtView, g_react.depthView};
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = g_react.rp;
+            fi.attachmentCount = 2;
+            fi.pAttachments = views;
+            fi.width = w;
+            fi.height = h;
+            fi.layers = 1;
+            ok = d->CreateFramebuffer(d->device, &fi, nullptr, &g_react.fb) == VK_SUCCESS;
+        }
+        if (!ok) {
+            g_react.failed = true;
+            g_react.mask = VK_NULL_HANDLE;
+            Log("[reactive] couldn't create the %ux%u images; reactive mask off", w, h);
+            return false;
+        }
+        VkDescriptorImageInfo rt{g_dlss.pointSampler, g_react.rtView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo mk{VK_NULL_HANDLE, g_react.maskView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet wr[2] = {};
+        wr[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_react.set, 0, 0, 1,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &rt, nullptr, nullptr};
+        wr[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_react.set, 1, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mk, nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 2, wr, 0, nullptr);
+        g_react.w = w;
+        g_react.h = h;
+        Log("[reactive] mask images %ux%u", w, h);
+    }
+    if (g_react.boundOut != g_dlss.outView) {
+        if (g_react.used) d->DeviceWaitIdle(d->device);
+        VkDescriptorImageInfo out{VK_NULL_HANDLE, g_dlss.outView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_react.set, 2, 0, 1,
+                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr};
+        d->UpdateDescriptorSets(d->device, 1, &wr, 0, nullptr);
+        g_react.boundOut = g_dlss.outView;
+    }
+    return true;
+}
+
+// Draws this frame's reactive mask (or clears it) into g_react.mask, left in GENERAL layout. Inside
+// RecordMetalFx, after the motion-vector pass (depth32Image in SHADER_READ_ONLY). False: no mask this frame.
+// Caller holds g_t.
+bool RecordReactive(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
+    if (!g_react.baseOk || !g_dlss.pointSampler || !ReactEnsureImages(d, g_dlss.inW, g_dlss.inH)) return false;
+    const uint32_t w = g_dlss.inW, h = g_dlss.inH;
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, GEN = VK_IMAGE_LAYOUT_GENERAL;
+    bool haveDraws = g_cfg.reactive && g_react.frame == g_frame && !g_react.draws.empty() && cs.mvPending &&
+                     g_dlss.sceneVpValid && g_dlss.depth32Image;
+    g_react.used = true;
+    if (!haveDraws) {
+        Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue zero{};
+        VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        d->CmdClearColorImage(cb, g_react.mask, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
+        Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, GEN);
+        return true;
+    }
+    // the scene's depth (the motion-vector pass's R32F copy) -> our D32 depth buffer, through a buffer
+    Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, RO, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy bc{};
+    bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    bc.imageExtent = {w, h, 1};
+    d->CmdCopyImageToBuffer(cb, g_dlss.depth32Image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_react.staging, 1, &bc);
+    Barrier(d, cb, g_dlss.depth32Image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, RO);
+    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = g_react.staging;
+    bb.size = VK_WHOLE_SIZE;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0,
+                          nullptr);
+    Barrier(d, cb, g_react.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    bc.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    d->CmdCopyBufferToImage(cb, g_react.staging, g_react.depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    Barrier(d, cb, g_react.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+
+    VkClearValue clear[2] = {};
+    VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g_react.rp;
+    rb.framebuffer = g_react.fb;
+    rb.renderArea = {{0, 0}, {w, h}};
+    rb.clearValueCount = 2;
+    rb.pClearValues = clear;
+    d->CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = g_dlss.sceneVp;  // the game's, with this frame's jitter (as its draws had)
+    if (ViewportJitterOn()) {
+        float jx, jy;
+        FrameJitter(jx, jy);
+        vp.x += jx;
+        vp.y += jy;
+    }
+    VkRect2D sc{{0, 0}, {w, h}};
+    d->CmdSetViewport(cb, 0, 1, &vp);
+    d->CmdSetScissor(cb, 0, 1, &sc);
+    VkPipeline bound = VK_NULL_HANDLE;
+    uint8_t boundCls = kRcNone;
+    for (const ReactDraw& rd : g_react.draws) {
+        if (rd.pipe != bound) {
+            d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rd.pipe);
+            bound = rd.pipe;
+            boundCls = kRcNone;  // dynamic state is kept, but set it again with each pipeline
+        }
+        if (rd.cls != boundCls) {
+            float k[4] = {0.f, 0.f, 0.f, ReactStrength(rd.cls)};
+            d->CmdSetBlendConstants(cb, k);
+            boundCls = rd.cls;
+        }
+        for (uint32_t i = 0; i < rd.sets.size(); ++i) {
+            const BoundSet& bs = rd.sets[i];
+            if (!bs.set || !bs.layout) continue;
+            d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bs.layout, i, 1, &bs.set,
+                                     (uint32_t)bs.dynOffsets.size(), bs.dynOffsets.data());
+        }
+        for (uint32_t i = 0; i < 16; ++i)
+            if (rd.vb[i].first) d->CmdBindVertexBuffers(cb, i, 1, &rd.vb[i].first, &rd.vb[i].second);
+        if (rd.pushLayout)
+            for (uint32_t i = 0; i < rd.pushCount; ++i)
+                d->CmdPushConstants(cb, rd.pushLayout, rd.pushRanges[i].stages, rd.pushRanges[i].offset,
+                                    rd.pushRanges[i].size, rd.push + rd.pushRanges[i].offset);
+        if (rd.indexed) {
+            if (!rd.ib) continue;
+            d->CmdBindIndexBuffer(cb, rd.ib, rd.ibOff, rd.ibType);
+            d->CmdDrawIndexed(cb, rd.count, rd.instances, rd.first, rd.vertexOffset, rd.firstInstance);
+        } else
+            d->CmdDraw(cb, rd.count, rd.instances, rd.first, rd.firstInstance);
+    }
+    d->CmdEndRenderPass(cb);
+    // alpha of the replay target -> the R32F mask
+    Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, GEN);
+    int32_t pc[5] = {(int32_t)w, (int32_t)h, (int32_t)w, (int32_t)h, 0};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_react.maskPipe);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_react.pipeLayout, 0, 1, &g_react.set, 0, nullptr);
+    d->CmdPushConstants(cb, g_react.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    d->CmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, GEN, GEN);
+    if (cs.capture && g_cap.reactive && g_cap.w == w && g_cap.h == h) {  // recording: the mask too
+        Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, GEN, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        d->CmdCopyImageToBuffer(cb, g_react.mask, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_cap.reactive, 1, &bc);
+        Barrier(d, cb, g_react.mask, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, GEN);
+        cs.capReactive = true;
+    }
+    g_react.maskFrame = g_frame;
+    if (LogFrame(g_frame))
+        Log("[reactive] frame %llu: %zu draws replayed (particles %u, animated %u, water %u, transparent %u); "
+            "%llu draws of copied pipelines outside the main 3D pass so far",
+            (unsigned long long)g_frame, g_react.draws.size(), g_react.drawsByClass[kRcParticle],
+            g_react.drawsByClass[kRcAnimated], g_react.drawsByClass[kRcWater], g_react.drawsByClass[kRcTransparent],
+            (unsigned long long)g_react.outside.load(std::memory_order_relaxed));
+    return true;
+}
+
+// reactive_debug=1: tint the upscaled image (GENERAL) red where this frame's mask is set. Caller holds g_t.
+void RecordReactiveDebug(DeviceData* d, VkCommandBuffer cb) {
+    if (!g_cfg.reactiveDebug || g_react.maskFrame != g_frame || !g_react.maskPipe || g_react.boundOut != g_dlss.outView)
+        return;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
+    int32_t pc[5] = {(int32_t)g_dlss.outW, (int32_t)g_dlss.outH, (int32_t)g_react.w, (int32_t)g_react.h, 1};
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_react.maskPipe);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_react.pipeLayout, 0, 1, &g_react.set, 0, nullptr);
+    d->CmdPushConstants(cb, g_react.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    d->CmdDispatch(cb, (g_dlss.outW + 7) / 8, (g_dlss.outH + 7) / 8, 1);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                          nullptr, 0, nullptr);
 }
 
 // Once per device. Caller holds g_t.
@@ -3963,10 +4616,12 @@ bool RecordMetalFx(DeviceData* d, VkCommandBuffer cb, CmdState& cs, const ImageI
         g_mfx.colorFmt = ci.fmt;
         g_mfx.colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
+    // the reactive mask for this frame (cleared if nothing feeds it); a scaler without one if it can't be made
+    bool mask = RecordReactive(d, cb, cs);
     if (g_mfx.inW != ci.w || g_mfx.inH != ci.h || g_mfx.outW != g_dlss.outW || g_mfx.outH != g_dlss.outH ||
-        g_mfx.confFmt != ci.fmt) {
+        g_mfx.confFmt != ci.fmt || g_mfx.confReactive != mask) {
         char err[256] = {};
-        if (!mfx_configure(ci.w, ci.h, g_dlss.outW, g_dlss.outH, (uint32_t)ci.fmt, err, sizeof err)) {
+        if (!mfx_configure(ci.w, ci.h, g_dlss.outW, g_dlss.outH, (uint32_t)ci.fmt, mask, err, sizeof err)) {
             Log("[mfx] scaler setup failed: %s", err);
             g_mfx.ready = false;
             g_mfx.why = err;
@@ -3977,9 +4632,10 @@ bool RecordMetalFx(DeviceData* d, VkCommandBuffer cb, CmdState& cs, const ImageI
         g_mfx.outW = g_dlss.outW;
         g_mfx.outH = g_dlss.outH;
         g_mfx.confFmt = ci.fmt;
+        g_mfx.confReactive = mask;
         g_dlss.resetNext = true;
-        Log("[mfx] temporal scaler %ux%u -> %ux%u (colour %s)", ci.w, ci.h, g_dlss.outW, g_dlss.outH,
-            FormatName(ci.fmt) ? FormatName(ci.fmt) : "?");
+        Log("[mfx] temporal scaler %ux%u -> %ux%u (colour %s, %s)", ci.w, ci.h, g_dlss.outW, g_dlss.outH,
+            FormatName(ci.fmt) ? FormatName(ci.fmt) : "?", mask ? "with a reactive mask" : "no reactive mask");
     }
     // the game's colour (RO) -> our copy
     Barrier(d, cb, cs.colorImage, VK_IMAGE_ASPECT_COLOR_BIT, RO, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -4037,6 +4693,7 @@ bool MfxPrepare(DeviceData* d, const CmdState& cs, MfxJob& job) {
     f.depth = MtlTexture(d, g_dlss.depth32Image);
     f.motion = MtlTexture(d, g_dlss.mvImage);
     f.output = MtlTexture(d, g_dlss.outImage);
+    f.reactive = g_mfx.confReactive && g_react.mask ? MtlTexture(d, g_react.mask) : nullptr;
     f.eventIn = g_mfx.mtlIn[job.slot];
     f.waitValue = job.vin + 1;
     f.eventOut = g_mfx.mtlOut[job.slot];
@@ -4749,6 +5406,10 @@ void RestoreGameState(DeviceData* d, VkCommandBuffer cb, const CmdState& cs) {
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bs.layout, i, 1, &bs.set,
                                  (uint32_t)bs.dynOffsets.size(), bs.dynOffsets.data());
     }
+    if (cs.pushLayout)  // the reactive pass pushes the replayed draws' constants
+        for (uint32_t i = 0; i < cs.pushCount; ++i)
+            d->CmdPushConstants(cb, cs.pushLayout, cs.pushRanges[i].stages, cs.pushRanges[i].offset,
+                                cs.pushRanges[i].size, cs.push + cs.pushRanges[i].offset);
 }
 
 // Record the upscaler (DLSS or FSR) into the game's command buffer, outside any render pass.
@@ -4777,7 +5438,19 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
                          (unsigned long long)g_frame, (int)colorLayout, (int)depthLayout);
         return;
     }
-    if (!EnsureImages(d, ci.w, ci.h, g_swapExtent.width, g_swapExtent.height)) return;
+    VkExtent2D out = UpscaleExtent(ci.w, ci.h, backend == Backend::MetalFx);
+    static VkExtent2D loggedOut{}, loggedSwap{};
+    if (out.width != loggedOut.width || out.height != loggedOut.height || g_swapExtent.width != loggedSwap.width ||
+        g_swapExtent.height != loggedSwap.height) {
+        loggedOut = out;
+        loggedSwap = g_swapExtent;
+        if (out.height != g_swapExtent.height)
+            Log("[upscale] upscaling %ux%u to %ux%u; the game's blit stretches that to the screen (%ux%u)%s", ci.w,
+                ci.h, out.width, out.height, g_swapExtent.width, g_swapExtent.height,
+                g_cfg.upscaleTo > 0 && out.height <= (uint32_t)g_cfg.upscaleTo ? " (upscale_to)"
+                                                                               : " (MetalFX upscales 3x at most)");
+    }
+    if (!EnsureImages(d, ci.w, ci.h, out.width, out.height)) return;
     if (backend == Backend::Dlss && !EnsureDlssFeature(d, cb)) return;  // auto mode moves on to FSR next frame
     if (backend == Backend::Fsr && (!g_dlss.mvReady || !FsrEnsure(d))) {
         if (!g_dlss.mvReady && verbose) Log("[fsr] the motion-vector pass isn't available; FSR needs it");
@@ -4931,6 +5604,9 @@ void RecordUpscale(DeviceData* d, VkCommandBuffer cb, CmdState& cs) {
     }
     g_cap.outPending = false;
     if (ok && backend != Backend::Fsr) RecordSharpen(d, cb);  // FSR sharpens itself (RCAS)
+#ifdef __APPLE__
+    if (ok && backend == Backend::MetalFx) RecordReactiveDebug(d, cb);
+#endif
     GpuMark(d, cb, kGmSharpen);
     if (g_cfg.debugView && ok && (g_cfg.debugView == 2 || cs.mvPending)) RecordDebugView(d, cb, cs);
     if (ok) RecordOverlay(d, cb, backend, cs, ci.w, ci.h);
@@ -5823,6 +6499,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateShaderModule(VkDevice device, co
                 Log("[probe] vertex shader %s: instAttrModel at location %d, attrPosition at location %d%s",
                     H(*pModule).c_str(), vi.mdlLoc, vi.posLoc, vi.skinned ? ", skinned" : "");
         }
+#ifdef __APPLE__
+        if (uint8_t rc = ReactModuleClass(pInfo->pCode, pInfo->codeSize / 4)) {
+            TLock lk(g_t);
+            g_moduleReact[*pModule] = rc;
+        }
+#endif
         Kind k = Classify(pInfo->pCode, pInfo->codeSize);
         if (k != Kind::Other) {
             TLock lk(g_t);
@@ -5902,8 +6584,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
         }
     }
     ps.reset();  // the driver's time isn't ours
-    VkResult r = GetDevice(Key(device))->CreateGraphicsPipelines(device, cache, count, infos.data(), pAllocator, pPipelines);
+    DeviceData* dev = GetDevice(Key(device));
+    VkResult r = dev->CreateGraphicsPipelines(device, cache, count, infos.data(), pAllocator, pPipelines);
     if (r != VK_SUCCESS) return r;
+    // Reactive mask (MetalFX): a copy of each pipeline that draws things without motion vectors.
+    std::vector<uint8_t> reactCls(count, kRcNoneValue);
+    std::vector<VkPipeline> reactPipe(count, VK_NULL_HANDLE);
+#ifdef __APPLE__
+    {
+        TLock lk(g_t);
+        for (uint32_t i = 0; i < count; ++i)
+            if (pPipelines[i] && g_cfg.reactive) reactCls[i] = ReactClassify(infos[i]);
+    }
+    for (uint32_t i = 0; i < count; ++i)
+        if (reactCls[i] && ReactStrength(reactCls[i]) > 0.f) reactPipe[i] = ReactClone(dev, infos[i], reactCls[i]);
+#endif
     ps.emplace(kPerfCreate);
     TLock lk(g_t);
     for (uint32_t i = 0; i < count; ++i)
@@ -6063,6 +6758,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateGraphicsPipelines(VkDevice devic
         if (v != g_pipeVtx.end()) info->hasVtx = true, info->vtx = v->second;
         auto st = g_pipeState.find(pPipelines[i]);
         info->screenPass = st != g_pipeState.end() && !st->second.depthTest;
+        info->react = reactPipe[i] ? reactCls[i] : kRcNoneValue;
+        info->reactPipe = reactPipe[i];
         g_pipeInfo[pPipelines[i]] = std::move(info);
     }
     return r;
@@ -6077,6 +6774,9 @@ static VKAPI_ATTR void VKAPI_CALL tf3_DestroyPipeline(VkDevice device, VkPipelin
         g_pipeVp.erase(pipeline);
         g_pipeState.erase(pipeline);
         std::unique_lock<std::shared_mutex> pl(g_pipeInfoLock);
+        auto it = g_pipeInfo.find(pipeline);
+        if (it != g_pipeInfo.end() && it->second->reactPipe)  // its reactive-mask copy (never in use without it)
+            GetDevice(Key(device))->DestroyPipeline(device, it->second->reactPipe, nullptr);
         g_pipeInfo.erase(pipeline);
         g_pipeInfoGen.fetch_add(1, std::memory_order_release);
     }
@@ -6095,13 +6795,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSampler(VkDevice device, const V
                                                        const VkAllocationCallbacks* pAllocator, VkSampler* pSampler) {
     VkSamplerCreateInfo info = *pInfo;
     float bias = 0.f;
+    uint32_t lodOutW = 0;
     {
         TLock lk(g_t);
         // Only with an upscaler: the game's own FSR 1 doesn't recover the detail, it would just shimmer.
         if (!UpscalerExpected()) bias = 0.f;
         else if (g_cfg.mipBiasAuto) {
-            if (g_sceneRenderW && g_swapExtent.width && g_sceneRenderW < g_swapExtent.width)
-                bias = std::log2((float)g_sceneRenderW / (float)g_swapExtent.width);
+            if (g_sceneRenderW && g_swapExtent.width) {
+                // relative to what the upscaler writes, which is less than the screen with upscale_to
+                bool mfx = ActivePref() != UpscalerPref::Dlss && ActivePref() != UpscalerPref::Fsr;
+                uint32_t renderH = (uint32_t)((uint64_t)g_sceneRenderW * g_swapExtent.height / g_swapExtent.width);
+                lodOutW = UpscaleExtent(g_sceneRenderW, renderH, mfx).width;
+                if (g_sceneRenderW < lodOutW) bias = std::log2((float)g_sceneRenderW / (float)lodOutW);
+            }
         } else bias = g_cfg.mipBias;
         auto repeats = [](VkSamplerAddressMode m) {
             return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
@@ -6112,8 +6818,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_CreateSampler(VkDevice device, const V
         if (bias != 0.f && material) {
             info.mipLodBias += bias;
             if (biased++ < 3 || biased % 100 == 0)
-                Log("[lod] texture sampler %llu: LOD bias %+.2f (render %u / display %u)", (unsigned long long)biased,
-                    bias, g_sceneRenderW, g_swapExtent.width);
+                Log("[lod] texture sampler %llu: LOD bias %+.2f (render %u / upscaled %u)", (unsigned long long)biased,
+                    bias, g_sceneRenderW, lodOutW);
         } else if (++skipped <= 3 && bias != 0.f)
             Log("[lod] sampler left alone (maxLod %.1f, address %d/%d, aniso %d)", info.maxLod, (int)info.addressModeU,
                 (int)info.addressModeV, (int)info.anisotropyEnable);
@@ -6947,6 +7653,7 @@ void UpdateHot() {
     g_hot.jitter.store(ViewportJitterOn(), std::memory_order_relaxed);
     g_hot.jitterScreen.store(g_cfg.jitterScreenPasses != 0, std::memory_order_relaxed);
     g_hot.jitterOther.store(g_cfg.jitterOtherTargets != 0, std::memory_order_relaxed);
+    g_hot.react.store(g_cfg.reactive != 0, std::memory_order_relaxed);
     g_hot.inW.store(g_dlss.inW, std::memory_order_relaxed);
     g_hot.inH.store(g_dlss.inH, std::memory_order_relaxed);
 }
@@ -6975,6 +7682,30 @@ static VKAPI_ATTR void VKAPI_CALL tf3_CmdBindIndexBuffer(VkCommandBuffer cb, VkB
     GetDevice(Key(cb))->CmdBindIndexBuffer(cb, buffer, offset, type);
 }
 
+static VKAPI_ATTR void VKAPI_CALL tf3_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
+                                                       VkShaderStageFlags stages, uint32_t offset, uint32_t size,
+                                                       const void* pValues) {
+    {
+        PerfScope ps(kPerfState);
+        CmdState& cs = CmdFor(cb);
+        if ((uint64_t)offset + size <= sizeof cs.push) {
+            std::memcpy(cs.push + offset, pValues, size);
+            if (cs.pushLayout != layout) cs.pushCount = 0;
+            cs.pushLayout = layout;
+            uint32_t i = 0;
+            while (i < cs.pushCount && !(cs.pushRanges[i].stages == stages && cs.pushRanges[i].offset == offset &&
+                                         cs.pushRanges[i].size == size))
+                ++i;
+            if (i == cs.pushCount) {
+                if (cs.pushCount < 4) ++cs.pushCount;
+                else i = 3;
+                cs.pushRanges[i] = {stages, offset, size};
+            }
+        }
+    }
+    GetDevice(Key(cb))->CmdPushConstants(cb, layout, stages, offset, size, pValues);
+}
+
 // skip_game_fsr=1: the game's FSR 1 passes (EASU, RCAS) draw an image that nobody sees while DLSS or
 // FSR 3.1 runs (the blit shows ours instead), so their draws can be left out. Only while the upscaler
 // ran last frame; if it then fails, the screen shows a stale image for that frame. Caller holds g_t.
@@ -6993,7 +7724,14 @@ bool BeforeDraw(DeviceData* d, VkCommandBuffer cb, bool indexed, uint32_t count,
     ProbeDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
     uint64_t mesh = ObjCandidate(cs, indexed, count, instances, first, vertexOffset);
     ApplyViewport(d, cb, cs);
-    bool slow = mesh || cs.kind != Kind::Other || g_hot.drawLog.load(std::memory_order_relaxed) ||
+    bool react = cs.pipe && cs.pipe->reactPipe && instances && g_hot.react.load(std::memory_order_relaxed);
+#ifdef __APPLE__
+    if (react && !cs.fbIsScene) {
+        g_react.outside.fetch_add(1, std::memory_order_relaxed);
+        react = false;
+    }
+#endif
+    bool slow = mesh || react || cs.kind != Kind::Other || g_hot.drawLog.load(std::memory_order_relaxed) ||
                 // OnDraw: still looking for the camera buffer, and a set was bound since the last look
                 (cs.fbIsScene && !cs.hasView && !cs.sets.empty() && cs.viewGen != cs.setsGen) ||
                 // OnDraw: after RCAS, the blit search or the swap itself
@@ -7002,6 +7740,9 @@ bool BeforeDraw(DeviceData* d, VkCommandBuffer cb, bool indexed, uint32_t count,
     TLock lk(g_t);
     LogSceneDraw(cb, cs, indexed, count, instances, firstInstance);
     if (mesh) ObjRecordDraw(cs, mesh, indexed, count, instances, first, vertexOffset, firstInstance);
+#ifdef __APPLE__
+    if (react) ReactRecordDraw(cs, indexed, count, instances, first, vertexOffset, firstInstance);
+#endif
     plan = OnDraw(d, cs);
     if (cs.kind == Kind::FsrEasu) GpuMark(d, cb, kGmGameFsr);
     return !SkipGameFsrDraw(cs);
@@ -7248,16 +7989,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
 #ifdef __APPLE__
         // macOS hotkeys (debug_keys=1, game in front): Ctrl+Shift+D upscaler on/off (compare with the game's
         // FSR 1), Ctrl+Shift+O info box, Ctrl+Shift+Up/Down sharpness +/- 0.1, Ctrl+Shift+S sharpening RCAS <->
-        // CAS, Ctrl+Shift+A motion-adaptive sharpening on/off, Ctrl+Shift+F frame generation on/off (when the
+        // CAS, Ctrl+Shift+A motion-adaptive sharpening on/off, Ctrl+Shift+R reactive mask (on -> on in red -> off),
+        // Ctrl+Shift+F frame generation on/off (when the
         // game started with frame_gen=1), Ctrl+Shift+G write a generated frame and its neighbours to mvcap/ (90
         // frames later). Like the cfg_live reload, they last until tf3_dlss.cfg is saved again.
         if (g_cfg.debugKeys && g_frame % 2 == 0) {
-            enum { kA = 0, kS = 1, kD = 2, kF = 3, kG = 5, kO = 31, kUp = 126, kDown = 125, kShiftL = 56,
+            enum { kA = 0, kS = 1, kD = 2, kF = 3, kG = 5, kR = 15, kO = 31, kUp = 126, kDown = 125, kShiftL = 56,
                    kShiftR = 60, kCtrlL = 59, kCtrlR = 62 };
             bool ctrlShift = (mfx_key_down(kCtrlL) || mfx_key_down(kCtrlR)) &&
                              (mfx_key_down(kShiftL) || mfx_key_down(kShiftR)) && mfx_app_focused();
             static bool dWas = false, oWas = false, upWas = false, downWas = false, sWas = false, aWas = false,
-                        fWas = false, gWas = false;
+                        fWas = false, gWas = false, rWas = false;
             static float motionWas = 0.4f;  // the motion_sharpness Ctrl+Shift+A turns back on
             auto edge = [&](int key, bool& was) {
                 bool down = ctrlShift && mfx_key_down(key);
@@ -7302,6 +8044,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL tf3_QueuePresentKHR(VkQueue queue, const V
                     Log("[fg] Ctrl+Shift+F: frame generation %s (frame %llu)", g_cfg.frameGen ? "ON" : "OFF",
                         (unsigned long long)g_frame);
                 }
+            }
+            if (edge(kR, rWas)) {  // reactive mask: on -> on + red tint -> off -> on
+                if (g_cfg.reactive && !g_cfg.reactiveDebug) g_cfg.reactiveDebug = 1;
+                else if (g_cfg.reactive) g_cfg.reactive = 0, g_cfg.reactiveDebug = 0;
+                else g_cfg.reactive = 1;
+                Log("[reactive] Ctrl+Shift+R: reactive mask %s (frame %llu)",
+                    !g_cfg.reactive ? "OFF" : g_cfg.reactiveDebug ? "ON, shown in red" : "ON", (unsigned long long)g_frame);
             }
             if (edge(kG, gWas) && g_cfg.frameGen) {  // time to start moving the camera first
                 g_fg.dumpKeyFrame = g_frame + 90;

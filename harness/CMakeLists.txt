@@ -36,7 +36,7 @@ function(compile_shaders OUT_VAR DIR)
 endfunction()
 
 compile_shaders(FAKE_SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-  scene.vert scene.frag fullscreen.vert tonemap.frag easu.frag rcas.frag blit.frag ui.frag)
+  scene.vert scene.frag fullscreen.vert tonemap.frag easu.frag rcas.frag blit.frag ui.frag smoke.frag)
 add_executable(fake_tf3 fake_tf3.cpp ${FAKE_SHADERS})
 target_include_directories(fake_tf3 PRIVATE "${GEN_DIR}")
 find_package(Threads REQUIRED)
@@ -50,7 +50,8 @@ if(NOT WIN32)
   set(DLSS_SDK "$ENV{HOME}/DLSS" CACHE PATH "NVIDIA DLSS SDK folder (only its headers are used here)")
   set(LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../layer")
   compile_shaders(LAYER_SHADERS "${LAYER_DIR}/shaders"
-    camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag)
+    camera_mv.comp mv_debug.comp sharpen.comp overlay.comp test_upscale.comp object_mv.vert object_mv.frag reactive_mask.comp
+    reactive_const.frag)
   add_custom_command(OUTPUT "${GEN_DIR}/camera_mv_ms.spv.inc"
     COMMAND "${GLSLANG}" --target-env vulkan1.1 -V -x -DDEPTH_MS -o "${GEN_DIR}/camera_mv_ms.spv.inc" "${LAYER_DIR}/shaders/camera_mv.comp"
     DEPENDS "${LAYER_DIR}/shaders/camera_mv.comp" COMMENT "Compiling camera_mv.comp (DEPTH_MS)")
@@ -66,7 +67,7 @@ if(NOT WIN32)
     target_include_directories(VkLayer_tf3_dlss PRIVATE "${LAYER_DIR}/../macos")
     target_compile_definitions(VkLayer_tf3_dlss PRIVATE VK_USE_PLATFORM_METAL_EXT)
     target_link_libraries(VkLayer_tf3_dlss PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation"
-                          "-framework AppKit" "-framework CoreGraphics")
+                          "-framework AppKit" "-framework CoreGraphics" "-framework IOKit")
   endif()
   target_include_directories(VkLayer_tf3_dlss PRIVATE "${DLSS_SDK}/include" "${GEN_DIR}"
                              "${LAYER_DIR}/../third_party/ffx-api/include")
@@ -77,5 +78,13 @@ if(NOT WIN32)
     target_link_options(VkLayer_tf3_dlss PRIVATE -Wl,--no-undefined)
   endif()
   set_target_properties(VkLayer_tf3_dlss PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/layer")
-  configure_file(VkLayer_tf3_dlss_linux.json "${CMAKE_BINARY_DIR}/layer/VkLayer_tf3_dlss.json" COPYONLY)
+  if(APPLE)  # the manifest names the Linux library; on macOS the layer is a .dylib
+    set(LAYER_JSON_SRC "${CMAKE_CURRENT_SOURCE_DIR}/VkLayer_tf3_dlss_linux.json")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LAYER_JSON_SRC}")
+    file(READ "${LAYER_JSON_SRC}" LAYER_JSON)
+    string(REPLACE "VkLayer_tf3_dlss.so" "VkLayer_tf3_dlss.dylib" LAYER_JSON "${LAYER_JSON}")
+    file(WRITE "${CMAKE_BINARY_DIR}/layer/VkLayer_tf3_dlss.json" "${LAYER_JSON}")
+  else()
+    configure_file(VkLayer_tf3_dlss_linux.json "${CMAKE_BINARY_DIR}/layer/VkLayer_tf3_dlss.json" COPYONLY)
+  endif()
 endif()

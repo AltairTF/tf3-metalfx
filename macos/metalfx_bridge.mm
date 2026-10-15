@@ -3,11 +3,18 @@
 #import <MetalFX/MetalFX.h>
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/IOKitLib.h>
+#include <mach/mach.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "metalfx_bridge.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -111,6 +118,16 @@ void mfx_fg_gpu_window(double* medianMs, double* sumMs, double* maxMs, uint32_t*
     Window(g_fgTimes, medianMs, sumMs, maxMs, count);
 }
 
+float mfx_max_scale(void) {
+    static float cached = 0.f;
+    if (cached > 0.f) return cached;
+    id<MTLDevice> dev = g_device ? g_device : MTLCreateSystemDefaultDevice();
+    if (!dev) return 2.f;
+    if (@available(macOS 14.0, *)) cached = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:dev];
+    if (cached < 1.f) cached = 2.f;  // macOS 13: no query; 2x is what MetalFX supported there
+    return cached;
+}
+
 bool mfx_init(void* mtlDevice, char* err, int errLen) {
     g_device = (__bridge id<MTLDevice>)mtlDevice;
     if (!g_device) {
@@ -145,8 +162,13 @@ void mfx_shutdown(void) {
     g_device = nil;
 }
 
-bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t colorVkFormat, char* err,
-                   int errLen) {
+bool mfx_reactive_supported(void) {
+    if (@available(macOS 14.4, *)) return true;
+    return false;
+}
+
+bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uint32_t colorVkFormat,
+                   bool reactiveMask, char* err, int errLen) {
     if (!g_device) {
         SetErr(err, errLen, "MetalFX not initialised");
         return false;
@@ -176,6 +198,12 @@ bool mfx_configure(uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, uin
     desc.outputWidth = outW;
     desc.outputHeight = outH;
     desc.autoExposureEnabled = NO;  // the input is already tone-mapped
+    if (@available(macOS 14.4, *)) {
+        if (reactiveMask) {
+            desc.reactiveMaskTextureEnabled = YES;
+            desc.reactiveMaskTextureFormat = MTLPixelFormatR32Float;
+        }
+    }
     g_scaler = [desc newTemporalScalerWithDevice:g_device];
     ResetRecent(g_scalerTimes);  // new sizes: start the overlay's median again
     if (!g_scaler) {
@@ -362,6 +390,7 @@ bool mfx_encode(int slot, const MfxFrame* f, char* err, int errLen) {
         g_scaler.motionVectorScaleY = f->mvScaleY;
         g_scaler.reset = f->reset;
         g_scaler.depthReversed = f->depthReversed;
+        if (@available(macOS 14.4, *)) g_scaler.reactiveMaskTexture = (__bridge id<MTLTexture>)f->reactive;
         [g_scaler encodeToCommandBuffer:cb];
     } else {
         SetErr(err, errLen, "MetalFX scaler or textures missing; output not written this frame");
@@ -373,4 +402,122 @@ bool mfx_encode(int slot, const MfxFrame* f, char* err, int errLen) {
     [cb commit];
     g_slotCb[slot] = cb;
     return ok;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// perf=1 system sampling
+namespace {
+dispatch_source_t g_gpuTimer = nil;
+std::atomic<int64_t> g_gpuBusySum{0}, g_gpuBusyN{0};
+
+int ReadGpuBusy() {
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &it) != KERN_SUCCESS)
+        return -1;
+    int busy = -1;
+    for (io_object_t svc; (svc = IOIteratorNext(it)) != 0; IOObjectRelease(svc)) {
+        CFTypeRef st = IORegistryEntryCreateCFProperty(svc, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+        if (!st) continue;
+        if (CFGetTypeID(st) == CFDictionaryGetTypeID()) {
+            CFTypeRef n = CFDictionaryGetValue((CFDictionaryRef)st, CFSTR("Device Utilization %"));
+            int v = 0;
+            if (n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)n, kCFNumberIntType, &v))
+                busy = std::max(busy, v);
+        }
+        CFRelease(st);
+    }
+    IOObjectRelease(it);
+    return busy;
+}
+
+struct ThreadSample {
+    double cpuSec;
+    std::string name;
+};
+std::mutex g_sysLock;
+std::unordered_map<uint64_t, double> g_threadCpu;  // thread id -> CPU seconds at the last window
+double g_sysWallSec = 0.0, g_sysProcSec = 0.0;
+
+double WallSec() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+double ProcessCpuSec() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+}
+
+std::unordered_map<uint64_t, ThreadSample> SampleThreads() {
+    std::unordered_map<uint64_t, ThreadSample> out;
+    thread_act_array_t list = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) return out;
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        thread_identifier_info_data_t id{};
+        mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+        thread_extended_info_data_t ext{};
+        mach_msg_type_number_t m = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(list[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &n) == KERN_SUCCESS &&
+            thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &m) == KERN_SUCCESS) {
+            ext.pth_name[sizeof ext.pth_name - 1] = 0;
+            out[id.thread_id] = {(ext.pth_user_time + ext.pth_system_time) / 1e9,
+                                 ext.pth_name[0] ? ext.pth_name : "thread " + std::to_string(id.thread_id)};
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof(thread_act_t));
+    return out;
+}
+}  // namespace
+
+void mfx_sys_start(void) {
+    std::lock_guard<std::mutex> lk(g_sysLock);
+    g_threadCpu.clear();
+    for (auto& [tid, t] : SampleThreads()) g_threadCpu[tid] = t.cpuSec;
+    g_sysWallSec = WallSec();
+    g_sysProcSec = ProcessCpuSec();
+    g_gpuBusySum = 0;
+    g_gpuBusyN = 0;
+    if (g_gpuTimer) return;
+    g_gpuTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(g_gpuTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_gpuTimer, ^{
+        int v = ReadGpuBusy();
+        if (v < 0) return;
+        g_gpuBusySum += v;
+        g_gpuBusyN += 1;
+    });
+    dispatch_resume(g_gpuTimer);
+}
+
+void mfx_sys_window(double* gpuBusyPct, double* processCpuPct, double* topThreadPct, char* topThreads,
+                    int topThreadsLen) {
+    std::lock_guard<std::mutex> lk(g_sysLock);
+    int64_t n = g_gpuBusyN.exchange(0), sum = g_gpuBusySum.exchange(0);
+    *gpuBusyPct = n ? (double)sum / (double)n : -1.0;
+    double wall = WallSec(), proc = ProcessCpuSec();
+    double dt = std::max(wall - g_sysWallSec, 1e-3);
+    *processCpuPct = 100.0 * (proc - g_sysProcSec) / dt;
+    g_sysWallSec = wall;
+    g_sysProcSec = proc;
+
+    std::vector<std::pair<double, std::string>> busy;
+    std::unordered_map<uint64_t, double> now;
+    for (auto& [tid, t] : SampleThreads()) {
+        now[tid] = t.cpuSec;
+        auto prev = g_threadCpu.find(tid);
+        double d = t.cpuSec - (prev != g_threadCpu.end() ? prev->second : t.cpuSec);
+        busy.push_back({100.0 * d / dt, t.name});
+    }
+    g_threadCpu = std::move(now);
+    std::sort(busy.begin(), busy.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    *topThreadPct = busy.empty() ? 0.0 : busy[0].first;
+    std::string text;
+    for (size_t i = 0; i < busy.size() && i < 3; ++i) {
+        char b[96];
+        std::snprintf(b, sizeof b, "%s%s %.0f%%", i ? ", " : "", busy[i].second.c_str(), busy[i].first);
+        text += b;
+    }
+    if (topThreads && topThreadsLen > 0) std::snprintf(topThreads, (size_t)topThreadsLen, "%s", text.c_str());
 }
